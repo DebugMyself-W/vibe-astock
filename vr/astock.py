@@ -127,15 +127,30 @@ def _report_session():
     return s
 
 
-def eastmoney_reports(code: str, max_pages: int = 3) -> list[dict]:
-    """按个股代码拉研报列表（qType=0）。"""
+def _normalize_end_date(end_date: str | None) -> str | None:
+    if not end_date:
+        return None
+    return datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+
+
+def _dated_on_or_before(value: object, cutoff: str) -> bool:
+    try:
+        observed = datetime.strptime(str(value or "")[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return False
+    return observed <= cutoff
+
+
+def eastmoney_reports(code: str, max_pages: int = 3, end_date: str | None = None) -> list[dict]:
+    """按个股代码拉研报列表（qType=0），可限制发布日期截止日。"""
+    cutoff = _normalize_end_date(end_date)
     session = _report_session()
     out: list[dict] = []
     for page in range(1, max_pages + 1):
         params = {
             "industryCode": "*", "pageSize": "100", "industry": "*",
             "rating": "*", "ratingChange": "*",
-            "beginTime": "2000-01-01", "endTime": "2030-01-01",
+            "beginTime": "2000-01-01", "endTime": cutoff or "2030-01-01",
             "pageNo": str(page), "fields": "", "qType": "0",
             "orgCode": "", "code": code, "rcode": "",
             "p": str(page), "pageNum": str(page), "pageNumber": str(page),
@@ -149,7 +164,7 @@ def eastmoney_reports(code: str, max_pages: int = 3) -> list[dict]:
         if page >= (d.get("TotalPage", 1) or 1):
             break
         time.sleep(0.3)
-    return out
+    return [row for row in out if _dated_on_or_before(row.get("publishDate"), cutoff)] if cutoff else out
 
 
 def eastmoney_industry_reports(keywords: list[str] | None = None, days: int = 90, max_pages: int = 3) -> list[dict]:
@@ -202,11 +217,17 @@ def profit_forecast(code: str) -> list[dict]:
     return df.to_dict("records") if df is not None and not df.empty else []
 
 
-def stock_news(code: str, limit: int = 20) -> list[dict]:
-    """个股新闻（东财）。"""
+def stock_news(code: str, limit: int = 20, end_date: str | None = None) -> list[dict]:
+    """个股新闻（东财），可限制发布日期截止日。"""
+    cutoff = _normalize_end_date(end_date)
     ak = _akshare()
     df = ak.stock_news_em(symbol=code)
-    return df.head(limit).to_dict("records") if df is not None and not df.empty else []
+    if df is None or df.empty:
+        return []
+    rows = df.to_dict("records")
+    if cutoff:
+        rows = [row for row in rows if _dated_on_or_before(row.get("发布时间"), cutoff)]
+    return rows[:limit]
 
 
 def individual_info(code: str) -> dict:

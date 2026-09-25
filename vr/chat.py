@@ -44,7 +44,7 @@ ANALYSIS_FRAMEWORK = """【投研分析框架】当用户要你分析个股、�
 
 # 用 f-string 先把框架焊进去，只留 {{context}} 给运行时 .format() 填——4 处调用点无需改。
 SYSTEM_PROMPT = f"""你是 Vibe-Research 里的投研助理。你可以调用工具获取客观数据来支撑回答：
-A 股用 query_quote / query_valuation / query_reports / query_news（传 6 位代码）；
+A 股用 query_quote / query_valuation / query_reports / query_news / query_dragon_tiger（传 6 位代码）；
 美股 / 港股 / 韩股用 query_global_stock（美股用字母代码如 AAPL / NVDA，港股用数字如 00700，韩股用 6 位数字加 .KS 如三星 005930.KS）。
 
 硬性规则（务必遵守）：
@@ -92,7 +92,10 @@ TOOLS = [
             "description": "查个股近期研报列表（标题/机构/评级/日期）。",
             "parameters": {
                 "type": "object",
-                "properties": {"code": {"type": "string", "description": "6 位股票代码"}},
+                "properties": {
+                    "code": {"type": "string", "description": "6 位股票代码"},
+                    "end_date": {"type": "string", "description": "资料发布日期截止日，格式 YYYY-MM-DD；历史分析必须传入"},
+                },
                 "required": ["code"],
             },
         },
@@ -104,7 +107,25 @@ TOOLS = [
             "description": "查个股近期新闻（标题/时间/来源）。",
             "parameters": {
                 "type": "object",
-                "properties": {"code": {"type": "string", "description": "6 位股票代码"}},
+                "properties": {
+                    "code": {"type": "string", "description": "6 位股票代码"},
+                    "end_date": {"type": "string", "description": "资料发布日期截止日，格式 YYYY-MM-DD；历史分析必须传入"},
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_dragon_tiger",
+            "description": "查单只 A 股近期龙虎榜：上榜记录、最近一次买卖席位 TOP5、机构专用席位净买。仅返回公开客观数据，不负责猜测席位背后的游资身份。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "6 位股票代码"},
+                    "trade_date": {"type": "string", "description": "截止交易日，格式 YYYY-MM-DD；不传则使用当前日期"},
+                },
                 "required": ["code"],
             },
         },
@@ -132,11 +153,22 @@ def _exec_tool(name: str, args: dict):
         if name == "query_valuation":
             return astock.full_valuation(str(args["code"]))
         if name == "query_reports":
-            rows = astock.eastmoney_reports(str(args["code"]), max_pages=1)[:15]
+            rows = astock.eastmoney_reports(
+                str(args["code"]), max_pages=1,
+                end_date=str(args.get("end_date") or "") or None,
+            )[:15]
             return [{k: r.get(k) for k in ("title", "publishDate", "orgSName", "emRatingName")} for r in rows]
         if name == "query_news":
-            rows = astock.stock_news(str(args["code"]), limit=15)
+            rows = astock.stock_news(
+                str(args["code"]), limit=15,
+                end_date=str(args.get("end_date") or "") or None,
+            )
             return [{k: r.get(k) for k in ("新闻标题", "发布时间", "文章来源")} for r in rows]
+        if name == "query_dragon_tiger":
+            return astock.dragon_tiger_board(
+                str(args["code"]),
+                trade_date=str(args.get("trade_date") or "") or None,
+            )
         if name == "query_global_stock":
             data = gstock.us_hk_stock(str(args.get("symbol", "")))
             return data or {"error": "未找到该美股/港股/韩股代码"}

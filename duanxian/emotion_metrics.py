@@ -471,22 +471,26 @@ def cycle_position(date: str, lookback: int = 10) -> dict:
     }
 
 
-def build_metrics(date: str, with_cycle: bool = True) -> dict:
+def build_metrics(date: str, with_cycle: bool = True, existing: Optional[dict] = None) -> dict:
     """派生指标一起算（共用同一个前一交易日 + 涨停池缓存，少查很多次）。
 
     `with_cycle=False` 可跳过周期位置——它要拉 ~10 天涨停池，是这里最慢的一项。
     """
-    prev = trade_calendar.prev_trade_date(date)
+    existing = existing if isinstance(existing, dict) else {}
+    prev = existing.get("prev_date") or trade_calendar.prev_trade_date(date)
+    def reusable(key: str):
+        value = existing.get(key)
+        return value if isinstance(value, dict) and value.get("available") is True else None
     out = {
         "date": date,
         "prev_date": prev,
-        "money_effect": money_effect(date, prev),
-        "promotion": promotion_rates(date, prev),
-        "consec_premium": consec_premium(date, prev),
-        "ladder_gap": ladder_gap(date),
+        "money_effect": reusable("money_effect") or money_effect(date, prev),
+        "promotion": reusable("promotion") or promotion_rates(date, prev),
+        "consec_premium": reusable("consec_premium") or consec_premium(date, prev),
+        "ladder_gap": reusable("ladder_gap") or ladder_gap(date),
     }
     if with_cycle:
-        out["cycle"] = cycle_position(date)
+        out["cycle"] = reusable("cycle") or cycle_position(date)
     return out
 
 

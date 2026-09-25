@@ -349,6 +349,22 @@ def feedback_matrix(date: str, prev: Optional[str] = None) -> dict:
     from .data import is_limit_up
 
     prev = prev or trade_calendar.prev_trade_date(date)
+    # 反馈对象是「昨日」涨停/炸板股；题材必须按昨日场次取，不能拿复盘当天的
+    # 原因串混进来。缺失时保留空值，前端如实显示“暂缺”。
+    reasons: dict[str, str] = {}
+    if prev:
+        try:
+            # 与「盘面数据 → 昨日短线情绪」共用首板原因服务：优先读已验证缓存，
+            # 问财不可用时还能走公开来源；不能直接用底层 fetch_zt_reasons，
+            # 否则没有 IWENCAI_API_KEY 的复盘页会把所有原因显示成“暂缺”。
+            from .theme_reasons import get_reasons
+            reasons, _reason_error = get_reasons(prev)
+        except Exception:  # noqa: BLE001
+            try:
+                import firstboard
+                reasons, _reason_error = firstboard.get_reasons(prev.replace("-", ""))
+            except Exception:  # noqa: BLE001
+                reasons = {}
     srows = _settled_rows(date)
     if srows:
         got = [r for r in srows if r.get("ret") is not None]
@@ -374,7 +390,8 @@ def feedback_matrix(date: str, prev: Optional[str] = None) -> dict:
                 matrix.setdefault(t, {k: 0 for k in _RESULT_ORDER})[res] += 1
                 details.append({"code": r["code"], "name": r["name"], "board": b,
                                 "prev_tier": t, "ret": round(r["ret"], 2),
-                                "result": res, "sector": r.get("sector") or ""})
+                                "result": res, "sector": r.get("sector") or "",
+                                "reason": reasons.get(r["code"]) or r.get("reason") or ""})
             for t, cell in matrix.items():
                 base = sum(cell.values())
                 cell["合计"] = base
@@ -433,6 +450,7 @@ def feedback_matrix(date: str, prev: Optional[str] = None) -> dict:
             "code": r["code"], "name": r["name"], "board": r["board"],
             "prev_tier": tier, "ret": round(v, 2), "result": res,
             "sector": r.get("sector") or "",
+            "reason": reasons.get(r["code"]) or r.get("reason") or "",
         })
 
     if not details:

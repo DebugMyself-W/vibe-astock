@@ -54,10 +54,38 @@ _EXTRA_PATH_DIRS = [
 
 _CLI_TIMEOUT_S = 300  # 子进程兜底超时（秒）
 _MAX_ARG_BYTES = 110_000  # 位置参数投递的提示词字节上限
+_TLS_FAILURE_MARKERS = (
+    "invalid peer certificate", "unknownissuer", "certificate verify failed",
+    "self signed certificate", "unable to get local issuer certificate",
+)
+_NETWORK_FAILURE_MARKERS = (
+    "connection failed", "error sending request", "os error 10013",
+)
 
 
 class CliUnavailable(RuntimeError):
     """本机未检测到对应 CLI（未安装 / 不在 PATH）。"""
+
+
+def _connection_failure(kind: str, output: object) -> str | None:
+    """把 CLI stderr 中已知的连接故障变成可操作的中文提示。"""
+    if isinstance(output, bytes):
+        text = output.decode("utf-8", errors="replace")
+    else:
+        text = str(output or "")
+    compact = " ".join(text.split())[-300:]
+    lowered = compact.casefold()
+    if any(marker in lowered for marker in _TLS_FAILURE_MARKERS):
+        return (
+            f"{kind} 无法连接模型服务：TLS 证书不受信任（{compact}）。"
+            "请检查代理根证书是否已被该运行环境信任，或改用 API 接入。"
+        )
+    if any(marker in lowered for marker in _NETWORK_FAILURE_MARKERS):
+        return (
+            f"{kind} 无法连接模型服务（{compact}）。"
+            "请检查网络/代理连通性，或改用 API 接入。"
+        )
+    return None
 
 
 def _find_bin(name: str) -> str | None:
@@ -126,11 +154,15 @@ def run_cli(kind: str, system_prompt: str, user_prompt: str) -> str:
                 timeout=_CLI_TIMEOUT_S,
             )
         except subprocess.TimeoutExpired as e:
+            if reason := _connection_failure(kind, e.stderr):
+                raise RuntimeError(reason) from e
             raise RuntimeError(f"{kind} 生成超时（>{_CLI_TIMEOUT_S}s）") from e
 
         out = (proc.stdout or "").strip()
         if proc.returncode != 0 and not out:
             err = (proc.stderr or "").strip()[:300]
+            if reason := _connection_failure(kind, err):
+                raise RuntimeError(reason)
             raise RuntimeError(f"{kind} 退出码 {proc.returncode}{'：' + err if err else ''}")
         return out
     finally:
@@ -167,7 +199,7 @@ def run_cli_stream(kind: str, system_prompt: str, user_prompt: str):
 
         proc = subprocess.Popen(
             [bin_path, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, cwd=tmpdir, env=env, text=True, bufsize=1,
+            stderr=subprocess.PIPE, cwd=tmpdir, env=env, text=True, bufsize=1,
         )
         if stdin_payload is not None:
             try:
@@ -180,35 +212,48 @@ def run_cli_stream(kind: str, system_prompt: str, user_prompt: str):
         # 读线程 + 队列：让 _CLI_TIMEOUT_S 约束整个流式过程。
         # 直接 `for line in proc.stdout` 是无限期阻塞读——CLI 挂起时永远走不到
         # proc.wait(timeout=...)，超时形同虚设，子进程会常驻堆积。
-        q: queue.Queue = queue.Queue()
+        q: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        stderr_parts: list[str] = []
 
-        def _pump(stdout=proc.stdout):
+        def _pump(source: str, stream):
             try:
-                for ln in stdout:
-                    q.put(ln)
+                for ln in stream:
+                    q.put((source, ln))
             except Exception:
                 pass
             finally:
-                q.put(None)  # EOF 哨兵
+                q.put((source, None))  # EOF 哨兵
 
-        threading.Thread(target=_pump, daemon=True).start()
+        threading.Thread(target=_pump, args=("stdout", proc.stdout), daemon=True).start()
+        threading.Thread(target=_pump, args=("stderr", proc.stderr), daemon=True).start()
         deadline = time.monotonic() + _CLI_TIMEOUT_S
+        closed: set[str] = set()
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError(f"{kind} 生成超时（>{_CLI_TIMEOUT_S}s）")
             try:
-                line = q.get(timeout=min(remaining, 1.0))
+                source, line = q.get(timeout=min(remaining, 1.0))
             except queue.Empty:
                 continue
             if line is None:
-                break
+                closed.add(source)
+                if closed == {"stdout", "stderr"}:
+                    break
+                continue
+            if source == "stderr":
+                stderr_parts.append(line)
+                if reason := _connection_failure(kind, line):
+                    raise RuntimeError(reason)
+                continue
             yield line
         try:
             rc = proc.wait(timeout=10)
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(f"{kind} 输出已结束但进程未退出") from e
         if rc != 0:
+            if reason := _connection_failure(kind, "".join(stderr_parts)):
+                raise RuntimeError(reason)
             raise RuntimeError(f"{kind} 退出码 {rc}")
     finally:
         if proc and proc.poll() is None:

@@ -5,6 +5,7 @@ export const MODULES = [
   { title: '盯盘', to: '/daily-review', icon: Eye, pages: [
     { to: '/daily-review', title: '盘面数据' }, { to: '/watch', title: '实时动态' },
     { to: '/yesterday-ladder', title: '昨日梯队' }, { to: '/agent/intraday', title: '盘中核验' },
+    { to: '/today-validation', title: '今日验证' },
   ] },
   { title: '复盘', to: '/agent/review', icon: Swords, pages: [
     { to: '/agent/review', title: '复盘报告' }, { to: '/first-board', title: '首板分析' },
@@ -37,5 +38,6 @@ const CHAT_PAGES: Record<string, string> = {
   '/portfolio': '持仓股', '/watchlist': '自选股', '/journal': '交易日志',
   '/settings': '接入 AI', '/my-stocks': '我的股票',
   '/yesterday-ladder': '昨日梯队', '/backtest-agent': '策略回测',
+  '/today-validation': '今日验证',
 };
 export function chatPageFor(pathname: string) { return CHAT_PAGES[pathname] ?? '工作空间'; }

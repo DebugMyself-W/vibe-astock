@@ -14,6 +14,25 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolate_followup_storage(tmp_path, monkeypatch):
+    from duanxian import followup_store
+    monkeypatch.setattr(followup_store, "DIR", str(tmp_path / "followups"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_reason_gateway(tmp_path, monkeypatch):
+    """Reason-cache and quota tests must never touch the developer's real state."""
+    from duanxian import app_settings, theme_reasons
+
+    monkeypatch.setattr(app_settings, "_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(theme_reasons, "_CACHE_DIR", str(tmp_path / "zt_reasons"))
+    monkeypatch.setattr(theme_reasons, "_STATUS_PATH", str(tmp_path / "iwencai_status.json"))
+    theme_reasons.reset_memory_for_tests()
+    yield
+    theme_reasons.reset_memory_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
     def blocked(self, *args, **kwargs):
         raise AssertionError(

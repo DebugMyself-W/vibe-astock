@@ -7,6 +7,8 @@ import logging
 import threading
 from typing import Optional
 
+from net_utils import call_with_requests_timeout, market_urlopen
+
 logger = logging.getLogger(__name__)
 
 from .util import china_now, china_today, is_a_share_closed, is_weekend
@@ -17,10 +19,13 @@ _REF_STOCK = "sh600000"  # 浦发银行，流动性好、每个交易日都有�
 def _ref_dates(start: str, end: str) -> list[str]:
     """参考股在 [start, end] 区间内的真实交易日（升序，YYYY-MM-DD）。失败返回空表。"""
     try:
-        import akshare as ak
-
-        df = ak.stock_zh_a_hist_tx(
-            symbol=_REF_STOCK, start_date=start.replace("-", ""), end_date=end.replace("-", "")
+        df = call_with_requests_timeout(
+            "akshare.stock_feature.stock_hist_tx",
+            "stock_zh_a_hist_tx",
+            symbol=_REF_STOCK,
+            start_date=start.replace("-", ""),
+            end_date=end.replace("-", ""),
+            timeout=8.0,
         )
         if df is None or "date" not in df.columns:
             return []
@@ -124,7 +129,7 @@ def quote_trade_day() -> Optional[str]:
         try:
             import urllib.request
 
-            raw = urllib.request.urlopen(_QUOTE_URL + _REF_STOCK, timeout=8).read().decode("gbk", "ignore")
+            raw = market_urlopen(_QUOTE_URL + _REF_STOCK, timeout=8).read().decode("gbk", "ignore")
             f = raw.split("~")
             ts = f[_F_QUOTE_TIME].strip() if len(f) > _F_QUOTE_TIME else ""
             if len(ts) >= 8 and ts[:8].isdigit():
@@ -141,9 +146,17 @@ def quote_trade_day() -> Optional[str]:
 
 
 def latest_session() -> Optional[str]:
-    """最近一个已收盘交易日。三层判据缺一不可："""
+    """最近一个已收盘交易日。
+
+    ``quote_trade_day`` 是参考股实时行情携带的实际交易日：盘前、周末和
+    节假日它会停在上一场收盘。历史日历偶尔晚到一场，因此只要这个日期明确早于
+    今天，就应优先使用它；否则盘面页的「已收盘定稿」会在非交易日倒退一天。
+    """
     today = china_today()
-    if not is_weekend(today) and is_a_share_closed() and quote_trade_day() == today:
+    quote_day = quote_trade_day()
+    if quote_day and quote_day < today:
+        return quote_day
+    if not is_weekend(today) and is_a_share_closed() and quote_day == today:
         return today
     latest = last_trade_dates(1)
     return latest[-1] if latest else None

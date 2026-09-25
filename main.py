@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import sys
 import time
+import html
+import re
 
 from duanxian import preflight, reflection, review_store
 from duanxian.llm_errors import LlmConfigError
@@ -20,8 +22,17 @@ from duanxian.review_graph import build_review_graph
 from duanxian.util import china_today, validate_trade_date
 
 
-def initial_state(trade_date: str) -> dict:
-    return {
+def _report_text(value: object) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", str(value or ""))).strip()
+
+
+def _has_missing_observation(values: object) -> bool:
+    return any(isinstance(value, dict) and value.get("available") is not True
+               for value in (values or {}).values())
+
+
+def initial_state(trade_date: str, cached_review: dict | None = None) -> dict:
+    state = {
         "trade_date": trade_date,
         "sentiment_report": "",
         "capital_report": "",
@@ -30,10 +41,37 @@ def initial_state(trade_date: str) -> dict:
         "leader_report": "",
         "macro_sector_report": "",
         "emotion_metrics": {}, "market_facts": {},  # 派生情绪指标（情绪面分析师写入）
+        "reuse_reports": {},
         "tomorrow_focus": "",
         "focus_struct": None,
         "past_context": reflection.get_past_context(end=trade_date),  # 反思闭环：注入历史命中回看
     }
+    if not isinstance(cached_review, dict):
+        return state
+
+    reports = {str(item.get("key")): _report_text(item.get("html"))
+               for item in (cached_review.get("analysts") or []) if isinstance(item, dict)}
+    warnings = " ".join(str(item) for item in (cached_review.get("warnings") or []))
+    metrics = cached_review.get("emotion_metrics") or {}
+    facts = cached_review.get("market_facts") or {}
+    sentiment_needs_refresh = _has_missing_observation(metrics) or _has_missing_observation(facts)
+    fields = {
+        "sentiment": "sentiment_report", "capital": "capital_report", "theme": "theme_report",
+        "dragon_tiger": "dragon_tiger_report", "leader": "leader_report",
+    }
+    titles = {"sentiment": "情绪面", "capital": "资金面", "theme": "题材热点",
+              "dragon_tiger": "龙虎榜", "leader": "龙头"}
+    reuse = {}
+    for key, field in fields.items():
+        text = reports.get(key, "")
+        state[field] = text
+        reuse[key] = bool(text and titles[key] not in warnings and
+                          not (key == "sentiment" and sentiment_needs_refresh))
+    state["macro_sector_report"] = str(cached_review.get("macro_sector") or "")
+    state["emotion_metrics"] = metrics
+    state["market_facts"] = facts
+    state["reuse_reports"] = reuse
+    return state
 
 
 def run(trade_date: str) -> tuple[dict, dict]:

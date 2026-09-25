@@ -17,11 +17,14 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from fastapi import Body, FastAPI, Request
+from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from duanxian import live_emotion, overseas, preflight, reflection, review_store, trade_calendar
+from duanxian import (
+    app_settings, live_emotion, overseas, preflight, reflection, review_store,
+    stock_explorer, theme_reasons, trade_calendar,
+)
 from duanxian.review_store import md_to_html as _md_to_html, strip_prefix as _strip_prefix
 from duanxian.config import make_llm
 from duanxian.review_graph import build_review_graph
@@ -567,6 +570,206 @@ def api_market_live_emotion():
     return live_emotion.snapshot()
 
 
+_traffic_memory: dict[str, dict] = {}
+_traffic_memory_lock = threading.Lock()
+
+
+def _traffic_confirm(key: str, date: str, desired: bool, signature: tuple,
+                     *, minimum_interval: float = 0.0) -> bool:
+    """Require two distinct process-local observations before granting green."""
+    now = time.monotonic()
+    with _traffic_memory_lock:
+        for old_key in list(_traffic_memory):
+            if not old_key.startswith(f"{date}:"):
+                _traffic_memory.pop(old_key, None)
+        full_key = f"{date}:{key}"
+        if not desired:
+            _traffic_memory.pop(full_key, None)
+            return False
+        previous = _traffic_memory.get(full_key)
+        if previous is None:
+            _traffic_memory[full_key] = {"signature": signature, "count": 1, "at": now}
+            return False
+        if signature and previous["signature"] and signature[0] != previous["signature"][0]:
+            _traffic_memory[full_key] = {"signature": signature, "count": 1, "at": now}
+            return False
+        distinct = signature != previous["signature"] or now - previous["at"] >= minimum_interval
+        if distinct:
+            previous.update(signature=signature, count=previous["count"] + 1, at=now)
+        return previous["count"] >= 2
+
+
+def _gate_live_environment(result: dict, snapshot: dict) -> dict:
+    """Apply the 09:35/10:00 and two-snapshot gates to an otherwise pure result."""
+    hhmm = str(snapshot.get("as_of") or "")[:5]
+    if len(hhmm) != 5:
+        return {**result, "light": "gray", "label": "数据不足", "summary": "盘中时间不可用。"}
+    if hhmm < "09:35":
+        return {**result, "light": "gray", "label": "开盘观察", "summary": "09:35前只采集快照。"}
+    if result["light"] not in ("green", "red") or result.get("hard_vetoes"):
+        return result
+    if hhmm < "10:00":
+        return {**result, "light": "yellow", "label": "黄灯 · 开盘观察",
+                "summary": "10:00前环境总灯最高为黄灯。"}
+    signature = tuple(snapshot.get(key) for key in (
+        "zt_count", "dt_count", "max_boards", "lianban_count", "break_rate", "promotion_rate"))
+    confirmed = _traffic_confirm("environment", str(snapshot.get("date") or ""), True,
+                                 (result["light"], *signature), minimum_interval=15.0)
+    if not confirmed:
+        return {**result, "light": "yellow", "label": "黄灯 · 等待确认",
+                "summary": "等待第二个有效盘中快照确认环境变化。"}
+    return result
+
+
+def _use_live_close_pool(live: dict, settled: dict, requested_date: Optional[str] = None) -> bool:
+    """Whether today's confirmed close pool is newer than the persisted review.
+
+    The daily close list becomes available before the full review archive is
+    generated.  During that short window, using `review_store.load()` would
+    incorrectly evaluate today's sealed names against yesterday's pool.
+    Explicit historical dates must never be substituted with the live pool.
+    """
+    live_day = str(live.get("date") or "")
+    stored_day = str(settled.get("target_date") or settled.get("trade_date") or "")
+    if not live_day or not live.get("available") or live.get("phase") != "已收盘":
+        return False
+    if requested_date:
+        return str(requested_date) == live_day
+    return live_day != stored_day
+
+
+@app.get("/api/market/board-traffic-light")
+def api_market_board_traffic_light(codes: str = Query(""), stock_mode: str = Query("live"), date: Optional[str] = Query(None)):
+    """Live environment light plus requested-stock lights; never an order trigger."""
+    requested = list(dict.fromkeys(code.strip() for code in codes.split(",") if code.strip()))
+    if len(requested) > 100 or any(not re.fullmatch(r"\d{6}", code) for code in requested):
+        return JSONResponse({"error": "codes 必须是最多100个逗号分隔的6位数字"}, status_code=400)
+    if stock_mode not in ("live", "settled"):
+        return JSONResponse({"error": "stock_mode 必须是 live 或 settled"}, status_code=400)
+    try:
+        import astock
+        import limit_alerts
+        import market
+        from duanxian.board_traffic_light import evaluate_live, evaluate_stock, industry_support_groups
+        from duanxian.theme_tree import primary_direction_groups
+
+        live = live_emotion.snapshot()
+        overview = market.get_overview() or {}
+        sentiment = overview.get("sentiment") or {}
+        breadth_values = [sentiment.get(key) for key in ("up", "down", "flat")]
+        breadth = {"available": all(isinstance(value, (int, float)) for value in breadth_values),
+                   "up": sentiment.get("up"), "down": sentiment.get("down"),
+                   "flat": sentiment.get("flat")}
+        index_items = astock.index_quote()
+        indices = {"available": len(index_items) == 4, "items": index_items}
+        settled = review_store.load(date) if date else (review_store.load() or {})
+        use_live_close_pool = _use_live_close_pool(live, settled, date)
+        # settled mode is a frozen 15:00 snapshot.  Never call the live
+        # environment evaluator or quote endpoint for this path.
+        if stock_mode == "settled":
+            requested_day = str(live.get("date") if use_live_close_pool else
+                                settled.get("target_date") or settled.get("trade_date") or live.get("date") or "")
+            environment = {} if use_live_close_pool else dict(settled.get("board_traffic_light") or {})
+            if not environment:
+                environment = {
+                    "mode": "settled", "light": "gray",
+                    "label": "收盘环境待归档" if use_live_close_pool else "未记录",
+                    "summary": "今日收盘榜已确认，综合收盘环境尚待生成。" if use_live_close_pool else "未记录收盘环境",
+                    "missing": ["settled_environment"],
+                }
+            environment.update({"mode": "settled", "date": requested_day, "as_of": "15:00:00"})
+            environment["source"] = "settled"
+        else:
+            environment = _gate_live_environment(evaluate_live(live, breadth, indices, settled), live)
+            # A stale breadth/index or pool snapshot must never be promoted to
+            # a live green light.  Providers that omit a date remain usable;
+            # an explicit mismatch is fail-closed gray.
+            live_date = str(live.get("date") or "")
+            if live_date and live_date != str(environment.get("date") or live_date):
+                environment = {**environment, "light": "gray", "label": "数据不足", "summary": "实时数据交易日不一致。", "missing": [*environment.get("missing", []), "source_date"]}
+
+        if not requested:
+            return environment
+        quotes = {} if stock_mode == "settled" else astock.tencent_quote(requested)
+        for code, quote in quotes.items():
+            quote["code"] = code
+        source_day, pool = live_emotion.current_limit_pool()
+        if stock_mode == "live" and source_day and live.get("date") and str(source_day) != str(live.get("date")):
+            environment = {**environment, "light": "gray", "label": "数据不足", "summary": "涨停池与实时环境交易日不一致。", "missing": [*environment.get("missing", []), "pool_date"]}
+        # 非交易日/盘前，未钉住的实时涨停池会以自然日标记上一交易日的收盘数据。
+        # 个股收盘灯必须带实际行情所属交易日，否则复盘导出无法与连板名单对齐。
+        day = (requested_day if stock_mode == "settled" else (trade_calendar.quote_trade_day() or source_day))
+        if stock_mode == "settled" and source_day and requested_day and source_day != requested_day:
+            pool = []
+        pool = pool or []
+        live_reason_map = {str(r.get("code")): str(r.get("reason") or "") for r in (live.get("lianban_stocks") or []) if isinstance(r, dict)}
+        # 首板的题材原因由全站统一网关缓存。实时情绪的 lianban_stocks 只覆盖
+        # 连板股，不能拿它当全涨停池原因源，否则首板详情会误报“有效题材缺失”。
+        shared_reason_map: dict[str, str] = {}
+        if day and pool:
+            shared_reason_map, _reason_error = theme_reasons.get_reasons(str(day))
+
+        def hhmm(value) -> str:
+            raw = str(int(value or 0)).zfill(6)
+            return f"{raw[:2]}:{raw[2:4]}" if raw != "000000" else ""
+
+        pool_rows = {str(row.get("c")): {
+            "code": str(row.get("c")), "name": row.get("n", ""),
+            "seal_time": hhmm(row.get("fbt")), "break_count": int(row.get("zbc") or 0),
+            "last_seal_time": hhmm(row.get("lbt")),
+            "seal_fund": row.get("fund") if isinstance(row.get("fund"), (int, float)) else None,
+            "float_cap": row.get("ltsz") if isinstance(row.get("ltsz"), (int, float)) else None,
+            "turnover_pct": row.get("hs") if isinstance(row.get("hs"), (int, float)) else None,
+            "industry": row.get("hybk", ""),
+            "reason": (row.get("reason", "")
+                       or shared_reason_map.get(str(row.get("c")), "")
+                       or live_reason_map.get(str(row.get("c")), "")),
+        } for row in pool}
+        pool_reasons = {code: str(row.get("reason") or "") for code, row in pool_rows.items()}
+        directions, theme_members = primary_direction_groups(pool_rows.values(), pool_reasons)
+        industry_groups = industry_support_groups(pool_rows.values())
+        as_of = "15:00:00" if stock_mode == "settled" else str(live.get("as_of") or china_now().strftime("%H:%M:%S"))
+        states = {} if stock_mode == "settled" else limit_alerts.observe_quotes(requested, quotes, day, as_of).get("states") or {}
+        stock_lights = {}
+        for code in requested:
+            quote, board_row = quotes.get(code) or {"code": code}, pool_rows.get(code) or {}
+            direction = directions.get(code) or {}
+            direction_name = str(direction.get("name") or "")
+            members = theme_members.get(direction_name, [])
+            industry = str(board_row.get("industry") or "")
+            industry_members = industry_groups.get(industry, [])
+            if stock_mode == "settled":
+                stock_lights[code] = evaluate_stock(
+                    environment, board_row or quote, board_row=board_row,
+                    theme_count=len(members), date=day, direction=direction,
+                    theme_members=members,
+                    industry_count=len(industry_members), industry_members=industry_members,
+                    as_of=as_of, mode="settled", persistent=True,
+                )
+                continue
+            first_pass = evaluate_stock(
+                environment, quote, state=states.get(code), board_row=board_row,
+                theme_count=len(members), date=day, direction=direction,
+                theme_members=members,
+                industry_count=len(industry_members), industry_members=industry_members,
+                as_of=as_of, mode="live", persistent=True,
+            )
+            confirmed = _traffic_confirm(f"stock:{code}", day, first_pass["light"] == "green",
+                                         (first_pass["stage"], quote.get("price"), quote.get("turnover_pct"),
+                                          quote.get("vol_ratio"), states.get(code, {}).get("status")), minimum_interval=15.0)
+            stock_lights[code] = evaluate_stock(
+                environment, quote, state=states.get(code), board_row=board_row,
+                theme_count=len(members), date=day, direction=direction,
+                theme_members=members,
+                industry_count=len(industry_members), industry_members=industry_members,
+                as_of=as_of, mode="live", persistent=confirmed,
+            )
+        return {**environment, "stock_mode": stock_mode, "stocks": stock_lights}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"打板红绿灯异常：{type(exc).__name__}: {exc}"}, status_code=502)
+
+
+
 @app.get("/api/market/overseas")
 def api_market_overseas():
     """隔夜外围：美港股指数 + 美股七姐妹，各自带交易日。
@@ -603,6 +806,67 @@ def api_review_capture(date: str):
         _capture_retry_lock.release()
 
 
+@app.get("/api/review/ladder")
+def api_review_ladder(date: str):
+    """所选复盘日的连板梯队明细；历史日只读精确日期，不拿今天替代。"""
+    try:
+        date = validate_trade_date(date)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return stock_explorer.ladder_details(date)
+
+
+@app.get("/api/market/industry-peers")
+def api_market_industry_peers(
+    industry: str = Query(..., min_length=1, max_length=40),
+    code: str = Query("", pattern=r"^$|^\d{6}$"),
+    limit: int = Query(300, ge=1, le=500),
+):
+    """点击连板股后展示其当前同行业成分，响应显式标注行情日期。"""
+    try:
+        return stock_explorer.industry_peers(industry, code, limit)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(
+            {"available": False, "reason": f"同行业数据暂不可用：{type(exc).__name__}", "members": []},
+            status_code=502,
+        )
+
+
+@app.get("/api/market/concept-peers")
+def api_market_concept_peers(
+    concept: str = Query(..., min_length=1, max_length=40),
+    code: str = Query("", pattern=r"^$|^\d{6}$"),
+    limit: int = Query(30, ge=1, le=100),
+):
+    """概念标签的当日热门成分股，按实时涨跌幅降序。"""
+    try:
+        # stock_explorer 先查行业再查概念；概念标签通常只会在第二轮命中，兼容
+        # 同名行业的情况也更符合用户看到的板块名称。
+        return stock_explorer.industry_peers(concept, code, limit, prefer_concept=True)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(
+            {"available": False, "reason": f"概念成分暂不可用：{type(exc).__name__}", "members": []},
+            status_code=502,
+        )
+
+
+@app.get("/api/market/intraday")
+def api_market_intraday(
+    codes: str = Query(..., min_length=6, max_length=48),
+    date: str | None = None,
+    days: int = Query(1, ge=1, le=5),
+):
+    """最多六只股票的 5 分钟线；个股行情卡可请求最近 1 至 5 个交易日。"""
+    items = [item.strip() for item in codes.split(",") if item.strip()]
+    if not items or len(items) > 6 or any(not re.fullmatch(r"\d{6}", item) for item in items):
+        return JSONResponse({"error": "codes 仅支持最多 6 个六位股票代码"}, status_code=400)
+    if date:
+        try:
+            date = validate_trade_date(date)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+    return stock_explorer.intraday_series(items, date, days)
+
 @app.get("/api/review/dates")
 def api_review_dates():
     """跑过复盘的交易日，新→旧。给看板的历史入口用。
@@ -632,6 +896,32 @@ def api_latest(date: Optional[str] = None):
     except Exception as exc:  # noqa: BLE001  战绩算不出来不该让整个复盘打不开
         print(f"⚠️ 战绩统计失败：{type(exc).__name__}: {exc}")
     return JSONResponse(payload)
+
+
+def _settings_response() -> dict:
+    return {**app_settings.get_settings(), "iwencai": theme_reasons.current_status()}
+
+
+@app.get("/api/settings")
+def api_settings():
+    return _settings_response()
+
+
+@app.put("/api/settings")
+def api_settings_update(request: Request, body: dict = Body(...)):
+    if _VR_API_KEY and request.headers.get("authorization", "") != f"Bearer {_VR_API_KEY}":
+        return JSONResponse({"detail": "未授权：缺少或错误的 VR_API_KEY"}, status_code=401)
+    if not _origin_ok(request):
+        return JSONResponse({"detail": "非法来源"}, status_code=403)
+    if "iwencai_intraday_refresh_minutes" not in body:
+        return JSONResponse({"detail": "缺少 iwencai_intraday_refresh_minutes"}, status_code=422)
+    try:
+        app_settings.update_settings(body["iwencai_intraday_refresh_minutes"], body.get("review_schedule"))
+    except ValueError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+    except OSError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=500)
+    return _settings_response()
 
 
 # ==================== ③ 近 5 天热度 ====================
@@ -841,6 +1131,56 @@ def index():
         status_code=503,
     )
 
+
+@app.get("/api/review/followup")
+def api_review_followup(date: str, at: Optional[str] = None):
+    from duanxian import followup_store
+    try:
+        return JSONResponse(followup_store.get(validate_trade_date(date), at))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.get("/api/today-validation")
+def api_today_validation(date: Optional[str] = None, at: Optional[str] = None):
+    """Unified V1 projection. Historical reads only use persisted snapshots."""
+    from duanxian import today_validation
+
+    try:
+        if date:
+            date = validate_trade_date(date)
+        return JSONResponse(today_validation.build(date, at))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.post("/api/review/followup/bindings")
+def api_followup_bindings(request: Request, date: str, body: dict = Body(...)):
+    from duanxian import followup_store
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    try:
+        prediction = followup_store.save_bindings(validate_trade_date(date), body.get("bindings"))
+        return {"ok": True, "version": prediction["version"]}
+    except followup_store.LockedPrediction as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/review/followup/notes")
+def api_followup_notes(request: Request, date: str, body: dict = Body(...)):
+    from duanxian import followup_store
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    try:
+        return {"ok": True, "note": followup_store.append_note(validate_trade_date(date), body.get("text", ""))}
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 @app.get("/api/verification/menu")
 def api_verify_menu(date: Optional[str] = None):
@@ -1613,11 +1953,14 @@ async def _lifespan(_app: FastAPI):
     # with respect to the new Agent's worker and private database.
     manager = ReviewAgentManager(ReviewAgentStore(_REVIEW_AGENT_ROOT), Path(_REVIEW_DIR),
                                  ReviewAgentRuntime(_REVIEW_AGENT_ROOT))
+    from duanxian.followup_service import collector
     _app.state.review_agent = manager
     try:
         _start_intraday()
+        collector.start()
         yield
     finally:
+        collector.stop()
         manager.shutdown()
         _app.state.review_agent = None
 

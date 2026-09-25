@@ -13,6 +13,10 @@ PHASES = ["冰点", "修复", "发酵", "亢奋", "退潮"]
 
 class FocusDirection(BaseModel):
     direction: str = Field(min_length=2, description="题材/板块/方向名")
+    theme_tags: List[str] = Field(
+        default_factory=list, max_length=3,
+        description="用于次日跟踪的 N 日题材标签；只能从冻结题材列表中精确选择，可为空",
+    )
     logic: str = Field(min_length=4, description="该方向今日活跃的支撑依据（情绪/资金/题材/龙头 哪几条）")
     risk: str = Field(min_length=2, description="该方向的风险 / 证伪信号")
 
@@ -72,7 +76,7 @@ FOCUS_SKELETON = """{
   "emotion_phase": "情绪档位，只能填：冰点/修复/发酵/亢奋/退潮 之一",
   "market_oneliner": "今日盘面一句话总结",
   "focus_directions": [
-    {"direction": "题材/板块名", "logic": "今日活跃的支撑依据(逻辑链)", "risk": "风险/证伪点"}
+    {"direction": "题材/板块名", "theme_tags": ["从冻结题材列表精确抄写的标签，最多3个"], "logic": "今日活跃的支撑依据(逻辑链)", "risk": "风险/证伪点"}
   ],
   "risk_alerts": ["风险信号1", "风险信号2"]
 }

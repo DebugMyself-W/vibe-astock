@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,7 @@ import portfolio as pf
 import market
 import myreports as mr
 import firstboard
+import limit_alerts
 import watchtower
 
 from product_version import PRODUCT_NAME, PRODUCT_VERSION
@@ -265,16 +267,25 @@ def market_overview():
 
 
 @app.get("/api/market/emotion")
-def market_emotion():
+def market_emotion(refresh: bool = Query(False, description="跳过短线情绪缓存，重新确认收盘池")):
     """短线情绪：连板梯队 / 最高连板 / 炸板率 / 封板率 / 晋级率 / 涨跌停家数。
 
     含连板梯队个股清单（code/name/连板数等）——2026-07-05 起如实展示客观公开榜单（东财同款），
     只呈现事实，不附推荐/评分/预测/买卖时机。全站共享缓存 5 分钟。
     """
     try:
-        return {"data": market.get_short_term_emotion()}
+        return {"data": market.get_short_term_emotion(force=refresh)}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"短线情绪异常：{e}") from e
+
+
+@app.get("/api/market/limit-break-alerts")
+def market_limit_break_alerts(codes: str = Query(..., description="逗号分隔的昨日连板股代码")):
+    """盘中炸板事件：先观察到封板，再跌破涨停价才报警；回封后可再次报警。"""
+    items = [code.strip() for code in codes.split(",") if code.strip()]
+    if not items or len(items) > 100 or any(not code.isdigit() or len(code) != 6 for code in items):
+        raise HTTPException(400, "codes 必须是最多 100 个逗号分隔的 6 位数字")
+    return {"data": limit_alerts.snapshot(items)}
 
 
 @app.get("/api/monitor/snapshot")
@@ -584,11 +595,17 @@ def fund_flow(code: str = Query(...)):
 
 
 @app.get("/api/dragon-tiger")
-def dragon_tiger(code: str = Query(...)):
+def dragon_tiger(code: str = Query(...), date: str | None = Query(None)):
     """龙虎榜：该股近期上榜记录 + 买卖席位 + 机构净买（东财）。缓存 30 分钟。"""
     code = _validate(code)
+    if date:
+        try:
+            date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(400, "date 必须是 YYYY-MM-DD") from exc
     try:
-        return {"data": _cached("dt", code, 1800, lambda: astock.dragon_tiger_board(code))}
+        cache_code = f"{code}:{date or 'latest'}"
+        return {"data": _cached("dt", cache_code, 1800, lambda: astock.dragon_tiger_board(code, trade_date=date))}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"龙虎榜异常：{e}") from e
 

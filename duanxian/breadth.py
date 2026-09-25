@@ -11,6 +11,8 @@ import time
 import urllib.request
 from typing import Optional
 
+from net_utils import market_urlopen
+
 from . import trade_calendar
 from .util import atomic_write_json
 
@@ -39,7 +41,7 @@ def _get(url: str, retries: int = 2) -> dict:
     for i in range(retries):
         try:
             req = urllib.request.Request(url, headers=_UA)
-            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+            with market_urlopen(req, timeout=_TIMEOUT) as resp:
                 return json.loads(resp.read().decode("utf-8", "replace"))
         except Exception as exc:  # noqa: BLE001
             last = exc

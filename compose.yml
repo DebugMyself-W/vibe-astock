@@ -1,0 +1,40 @@
+services:
+  vibe-astock:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+    container_name: vibe-astock
+    ports:
+      - "8910:8910"
+    environment:
+      VIBE_HOST: "0.0.0.0"
+      VIBE_PORT: "8910"
+      TZ: Asia/Shanghai
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+      http_proxy: ${HTTP_PROXY:-}
+      https_proxy: ${HTTPS_PROXY:-}
+      no_proxy: ${NO_PROXY:-localhost,127.0.0.1}
+      VIBE_MARKET_PROXY: ${VIBE_MARKET_PROXY:-0}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/app
+      - vibe_astock_pip_cache:/root/.cache/pip
+      - vibe_astock_npm_cache:/root/.npm
+      - vibe_astock_reviews:/root/.duanxian-agents
+      - vibe_astock_vr:/root/.vibe-research
+    working_dir: /app
+    command: ["python", "server.py"]
+    restart: unless-stopped
+
+volumes:
+  vibe_astock_pip_cache:
+  vibe_astock_npm_cache:
+  vibe_astock_reviews:
+  vibe_astock_vr:

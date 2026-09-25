@@ -2,9 +2,11 @@ import { Flame, TrendingUp, Layers, CalendarClock } from "lucide-react";
 import { pctColor, UP_TEXT, DOWN_TEXT } from "@/lib/colors";
 import { cn } from "@/lib/utils";
 import { Caliber } from "@/components/ui/Caliber";
+import { EmotionRegimePanel } from "@/components/EmotionRegime";
+import { LadderDetailsPanel } from "@/components/LadderExplorer";
 import { finite, plain, safeArray, safeRecord } from "@/lib/agent";
 import type {
-  ConsecPremium, EmotionCycle, EmotionMetrics, LadderGap, MoneyEffect, Promotion,
+  ConsecPremium, EmotionCycle, EmotionMetrics, EmotionRegime, LadderGap, MoneyEffect, Promotion,
 } from "@/lib/agent";
 
 /** 0~1 的比率 → 百分比文本 */
@@ -24,9 +26,10 @@ function tone(v?: number | null): string {
 
 /** 指标卡外壳。`caliber` = 这个数到底怎么算的（见 Caliber 组件的说明）。 */
 export function Card({
-  icon: Icon, title, hint, caliber, available, reason, children,
+  icon: Icon, title, hint, caliber, available, reason, children, mobileCentered = false,
 }: {
   icon: typeof Flame; title: string; hint: string; caliber?: string;
+  mobileCentered?: boolean;
   available?: boolean; reason?: string; children: React.ReactNode;
 }) {
   return (
@@ -34,7 +37,7 @@ export function Card({
       <div className="mb-1 flex items-center gap-1.5">
         <Icon className="h-4 w-4 text-primary" />
         <h3 className="text-sm font-bold">{title}</h3>
-        {caliber && <Caliber text={caliber} />}
+        {caliber && <Caliber text={caliber} mobileCentered={mobileCentered} />}
       </div>
       <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground/70">{hint}</p>
       {available ? children : (
@@ -140,7 +143,7 @@ export function ConsecPremiumCard({ cp }: { cp: ConsecPremium }) {
   );
 }
 
-export function LadderCard({ lg }: { lg: LadderGap }) {
+export function LadderCard({ lg, date }: { lg: LadderGap; date?: string }) {
   return (
     <Card
       icon={Layers} title="梯队结构"
@@ -168,6 +171,7 @@ export function LadderCard({ lg }: { lg: LadderGap }) {
         lg.continuous === false ? "text-danger" : "text-muted-foreground")}>
         {ladderNote(lg)}
       </p>
+      {date && <LadderDetailsPanel date={date} />}
     </Card>
   );
 }
@@ -186,27 +190,43 @@ function ladderNote(lg: LadderGap): string {
   return `板位缺档 ${gaps.map((g) => `${g}板`).join("、")} → 最高标${hi}下方断层，是否有同题材承接需另查，板位缺档本身不能判定`;
 }
 
-export function CycleCard({ cy }: { cy: EmotionCycle }) {
+export function CycleCard({ cy, regime }: { cy: EmotionCycle; regime?: EmotionRegime | null }) {
+  const series = safeArray<NonNullable<EmotionCycle["series"]>[number]>(cy.series);
+  const current = series[series.length - 1];
+  const flat = cy.flat ?? (series.length > 0 && series.every((d) => d.score === series[0].score));
   return (
     <Card
-      icon={CalendarClock} title="情绪周期"
-      hint="窗口内情绪分最低的那天视为本轮起点"
+      icon={CalendarClock} title="情绪周期 · 相对温度"
+      mobileCentered
+      hint="0～1，越高越热；窗口低点不等于新周期启动，情绪分不代表买入胜率"
       caliber={"情绪分 = 涨停家数、最高连板、炸板率三项在窗口内归一化后的平均，只用涨停池算。\n" +
         "炸板率是「越高越冷」，所以取反后再平均 —— 三项都指向同一个方向，分越高越热。\n" +
+        "分数上限为1；窗口改变会重算历史柱，不适合直接当跨窗口回测特征。\n" +
+        "区间位置 =（当前分－窗口最低分）/（窗口最高分－最低分），不是排名分位。\n" +
         "「第 N 天」= 今天距窗口最低点第几个交易日，不是自然日。\n" +
         "🔴 这是**可解释的启发式，不是精确的周期划分**：全市场压成一个数，而不同题材\n" +
         "完全可能同时处在启动、高潮和退潮。窗口内一路走低时，起点会落在最后一天\n" +
         "（= 仍在探底、记为第 1 天）。当参考，别当结论。"}
       available={cy.available} reason={cy.reason}
     >
-      <div className="flex items-end gap-6">
-        <Stat label={`起点 ${cy.trough_date ?? "—"}`} value={`第 ${cy.day_n ?? "—"} 天`} />
-        <Stat label="当前情绪分" value={finite(cy.current_score) != null ? finite(cy.current_score)!.toFixed(2) : "—"}
+      <EmotionRegimePanel regime={regime} />
+      <div className="flex flex-wrap items-end gap-6">
+        <Stat label={flat ? "窗口内无明显温差" : `窗口低点 ${cy.trough_date ?? "—"}`} value={flat ? "暂无明确低点" : `距低点第 ${cy.day_n ?? "—"} 天`} />
+        <Stat label="当前相对情绪分" value={finite(cy.current_score) != null ? `${finite(cy.current_score)!.toFixed(2)} / 1` : "—"}
           valueClass={
             cy.trend?.includes("走强") ? UP_TEXT
               : cy.trend?.includes("转弱") ? DOWN_TEXT : "text-foreground"
           } />
       </div>
+      {current && <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
+        <span>涨停 {current.limit_up} 家</span><span>最高 {current.highest_consec} 板</span>
+        <span>炸板率 {rate(current.broken_rate)}</span>
+        {current.components && <span>归一分项：数量 {current.components.limit_up.toFixed(2)} · 高度 {current.components.height.toFixed(2)} · 封板 {current.components.seal.toFixed(2)}</span>}
+      </div>}
+      {cy.partial && <p className="mt-2 text-xs text-warning">
+        数据不完整：缺失交易日 {safeArray<string>(cy.missing_dates).join("、") || "无"}；
+        炸板率补值日期 {safeArray<string>(cy.imputed_dates).join("、") || "无"}。
+      </p>}
       {}
       <p className="mt-2 rounded-lg bg-muted/40 px-2.5 py-1.5 text-[11px] leading-relaxed text-muted-foreground">
         ⚠️ 启发式，不是精确周期划分。全市场压成一个数，而不同题材可能同时处在启动 / 高潮 / 退潮。
@@ -245,13 +265,13 @@ export function CycleCard({ cy }: { cy: EmotionCycle }) {
       </div>
       <p className="mt-1.5 text-[12px] text-muted-foreground">
         {}
-        近 {cy.window ?? "—"} 个交易日 · 距窗口低点第 {cy.day_n ?? "—"} 天
+        有效 {cy.window ?? "—"} 个交易日{cy.expected_window != null && ` / 窗口 ${cy.expected_window} 日`}
         {cy.trend && <> · <b className={
           cy.trend.includes("走强") ? UP_TEXT
             : cy.trend.includes("转弱") ? DOWN_TEXT : "text-foreground"
         }>{cy.trend}</b></>}
-        {finite(cy.pctile) != null && ` · 位于十日区间 ${Math.round(finite(cy.pctile)! * 100)}% 分位`}
-        <span className="ml-1.5 inline-block h-2 w-2 rounded-sm bg-danger align-middle" /> 起点
+        {finite(cy.pctile) != null && ` · 窗口区间位置 ${Math.round(finite(cy.pctile)! * 100)}%（非排名分位）`}
+        <span className="ml-1.5 inline-block h-2 w-2 rounded-sm bg-danger align-middle" /> 窗口低点
         <span className="ml-2 font-bold text-foreground">加粗</span> 复盘当日
       </p>
     </Card>

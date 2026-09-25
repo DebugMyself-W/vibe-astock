@@ -173,13 +173,30 @@ export interface LadderGap extends MetricBase {
   continuous?: boolean;
   note?: string;
 }
+export interface LadderStock {
+  code: string; name: string; boards: number;
+  price?: number | null; pct?: number | null; amount?: number | null; float_cap?: number | null;
+  turnover_pct?: number | null; industry: string; reason?: string;
+  seal_time?: string; last_seal_time?: string; break_count?: number; seal_fund?: number | null;
+}
+export interface LadderDetailTier { boards: number; count: number; stocks: LadderStock[]; }
+export interface LadderDetails {
+  available: boolean; date: string; count?: number; highest?: number;
+  tiers: LadderDetailTier[]; reason?: string; reason_note?: string | null; source?: string;
+}
 export interface CycleDay {
   date: string; limit_up: number; highest_consec: number;
   broken_rate: number | null; score: number;
+  components?: { limit_up: number; height: number; seal: number };
 }
 /** 情绪周期位置：这波从哪天启动、今天第几天 */
 export interface EmotionCycle extends MetricBase {
   window?: number;
+  expected_window?: number;
+  missing_dates?: string[];
+  imputed_dates?: string[];
+  partial?: boolean;
+  flat?: boolean;
   trough_date?: string;
   trough_score?: number;
   current_score?: number;
@@ -188,7 +205,7 @@ export interface EmotionCycle extends MetricBase {
   rising?: boolean;
   /** 最近走向：连续两日走强 / 今日转弱 / 基本走平 … */
   trend?: string;
-  /** 当前值在十日区间的分位（0~1） */
+  /** 当前值在窗口高低区间的位置（0~1），不是历史排名分位 */
   pctile?: number | null;
   series?: CycleDay[];
 }
@@ -200,6 +217,39 @@ export interface EmotionMetrics {
   consec_premium?: ConsecPremium;
   ladder_gap?: LadderGap;
   cycle?: EmotionCycle;
+}
+export type EmotionPhase = "冰点" | "修复" | "发酵" | "亢奋" | "退潮";
+export type RetreatLevel = "normal" | "watch" | "warning" | "confirmed" | "insufficient";
+export interface EmotionRegimeSignal {
+  key: string;
+  label: string;
+  state: "healthy" | "risk" | "missing";
+  severe: boolean;
+  detail: string;
+  value?: number | null;
+}
+export interface EmotionRegime {
+  version: string;
+  mode: "settled" | "live";
+  /** 收盘已到但复盘定稿尚未产生；此时 live 仅供展示最后一笔日内快照。 */
+  settled_pending?: boolean;
+  date?: string | null;
+  as_of?: string | null;
+  phase: EmotionPhase | null;
+  phase_label: string;
+  temperature: number | null;
+  momentum: number | null;
+  confidence: "high" | "medium" | "low";
+  data_coverage: number;
+  issues: string[];
+  summary: string;
+  retreat: {
+    level: RetreatLevel;
+    label: string;
+    risk_count: number;
+    core_risk_count: number;
+    signals: EmotionRegimeSignal[];
+  };
 }
 // ---------- 客观事实表（market_facts）----------
 // 事实层回答"今天发生了什么"，指标层（EmotionMetrics）回答"什么温度"。两者互补。
@@ -232,12 +282,18 @@ export interface FeedbackCell {
 }
 export interface FeedbackDetail {
   code: string; name: string; board: string; prev_tier: string;
-  ret: number; result: string; sector: string;
+  ret: number; result: string; sector: string; reason?: string;
+  traffic_light?: StockTrafficLight;
+  next_session?: {
+    date: string; ret: number; result: string; source: "next_review_feedback";
+  };
 }
 export interface FeedbackMatrix extends FactBase {
   result_order?: string[];
   matrix?: Record<string, FeedbackCell>;
   details?: FeedbackDetail[];
+  next_session_date?: string;
+  next_session_matched?: number;
 }
 export interface ThemeRow {
   sector: string; limit_up: number; first_boards: number; consec_boards: number;
@@ -268,7 +324,7 @@ export interface ByBoard extends FactBase { boards?: Record<string, BoardStat>; 
 
 /** 题材事件树：按**真实事件题材**（问财涨停原因）聚合，不是行业分类 */
 export interface ThemeNode {
-  tag: string; state: string;
+  tag: string; kind?: "theme" | "catalyst"; state: string;
   limit_up: number; first_boards: number; consec_boards: number; highest: number;
   broken: number; limit_down: number; broken_rate: number | null;
   first_seal: string | null; last_seal: string | null;
@@ -282,6 +338,17 @@ export interface ThemeTree extends FactBase {
   date?: string; prev_date?: string; tag_count?: number;
   themes?: ThemeNode[]; concentration?: number | null;
   covered?: number; total_limit_up?: number; coverage_rate?: number | null;
+  reason_meta?: {
+    source?: "iwencai" | "ths_public" | "mixed" | "legacy" | "unavailable";
+    fetched_at?: string | null; cache_hit?: boolean; settled?: boolean;
+  };
+}
+
+export interface IwencaiStatus {
+  configured: boolean; source_priority: string[]; intraday_refresh_minutes: 0 | 30 | 60 | 120;
+  day: string; requests_today: number; successes_today: number; failures_today: number;
+  last_attempt_at: string | null; circuit_state: string; blocked_until: string | null;
+  circuit_reason: string | null;
 }
 
 /** 一个读数的历史统计位置。数字谁都能看，位置才是信号 */
@@ -372,6 +439,70 @@ export interface Scoreboard {
 }
 
 export interface AnalystReport { key: string; title: string; tag: string; html: string; }
+export interface EntrySignal {
+  key: string; label: string; value: number | null; unit: "rate" | "pct";
+  state: "bullish" | "bearish" | "neutral" | "missing";
+  reason: string; sample: number | null;
+  bull_threshold: number; bear_threshold: number; veto_threshold: number | null;
+  lower_is_better: boolean;
+}
+export interface EntryDecision {
+  version: string; scope: "review_only"; date: string | null;
+  status: "blocked" | "insufficient" | "candidate" | "observe" | "wait";
+  label: string; reason: string; candidate_eligible: boolean;
+  bullish_count: number; bearish_count: number;
+  signals: EntrySignal[]; vetoes: string[]; missing: string[]; issues: string[];
+  validation: string; pending_checks: string[];
+}
+export type TrafficLightColor = "green" | "yellow" | "red" | "gray";
+export interface TrafficSignal {
+  key: string; label: string;
+  state: "healthy" | "risk" | "neutral" | "missing" | "observed" | "informational";
+  detail: string; value?: number | null;
+  catalyst_detail?: string;
+  group_name?: string;
+  members?: Array<{
+    code?: string; name?: string; seal_time?: string; last_seal_time?: string;
+    break_count?: number; industry?: string;
+  }>;
+}
+export interface TrafficDimension {
+  key: "market" | "emotion" | "board"; label: string;
+  light: TrafficLightColor; light_label: string; summary: string;
+  signals: TrafficSignal[]; missing: string[];
+}
+export interface StockTrafficLight {
+  version: string; code: string; name: string; date?: string | null; as_of?: string;
+  mode?: "live_entry" | "settled_promotion";
+  stage: "not_ready" | "observe" | "sealed";
+  light: TrafficLightColor; label: string; summary: string;
+  quality?: {
+    light: TrafficLightColor; label: string; score: number; max_score: number;
+    summary: string; signals: TrafficSignal[]; risks: string[]; missing: string[];
+  };
+  action?: { light: TrafficLightColor; label: string; summary: string };
+  environment?: {
+    light: TrafficLightColor; label: string; date?: string | null; as_of?: string | null;
+    source: "live" | "settled" | "unavailable"; missing: string[];
+  };
+  signals: TrafficSignal[]; blockers: string[]; missing: string[]; uncovered: string[];
+  direction_basis?: string;
+  direction?: {
+    name: string; type: "theme" | "catalyst_only" | "missing"; basis: "event_tree";
+    member_count: number;
+    catalysts: Array<{ name: string; member_count: number }>;
+  } | null;
+}
+export interface BoardTrafficLight {
+  version: string; mode: "settled" | "live"; date?: string | null; as_of?: string;
+  /** settled 请求使用对应交易日 15:00 快照；live 请求使用盘中快照。 */
+  stock_mode?: "live" | "settled";
+  light: TrafficLightColor; label: string; summary: string;
+  dimensions: Record<"market" | "emotion" | "board", TrafficDimension>;
+  hard_vetoes: string[]; missing: string[]; reasons: string[];
+  validation: string; uncovered: string[]; baseline_date?: string | null;
+  stocks?: Record<string, StockTrafficLight>;
+}
 export interface ReviewData {
   report_grounding?: import("./report-grounding").GroundedReport;
   target_date?: string;
@@ -381,11 +512,15 @@ export interface ReviewData {
   focus: TomorrowFocus | null;
   focus_md?: string;
   emotion_metrics?: EmotionMetrics;
+  emotion_regime?: EmotionRegime;
+  entry_decision?: EntryDecision;
+  board_traffic_light?: BoardTrafficLight;
   market_facts?: MarketFacts;
   macro_sector?: string;
   reflection?: Reflection | null;
   scoreboard?: Scoreboard | null;
   analysts?: AnalystReport[];
+  iwencai_status?: IwencaiStatus;
 }
 
 // ---------- 近5天热度 ----------

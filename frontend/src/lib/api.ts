@@ -1,4 +1,5 @@
 let monitorWarning: string | undefined;
+import type { BoardTrafficLight, EmotionRegime, StockTrafficLight } from "./agent";
 import { apiUrl } from "./base";
 import { randomId } from "./random-id";
 let monitorId: string | undefined;
@@ -57,7 +58,7 @@ export async function downloadReport(id: string, name: string): Promise<void> {
   URL.revokeObjectURL(url);
 }
 
-async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET", body?: unknown): Promise<T> {
+async function request<T>(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: unknown): Promise<T> {
   let resp: Response;
   const headers: Record<string, string> = { ...authHeaders() };
   const opts: RequestInit = { method };
@@ -91,7 +92,7 @@ const get = <T>(path: string) => request<T>(path, "GET");
 export interface Quote {
   quote_time?: string | null; amount_wan?: number | null;
   name: string; price: number; last_close: number; change_pct: number;
-  pe_ttm: number; pb: number; mcap_yi: number; turnover_pct: number;
+  pe_ttm: number; pb: number; mcap_yi: number; float_mcap_yi?: number | null; turnover_pct: number;
   limit_up: number; limit_down: number;
 }
 
@@ -156,6 +157,35 @@ export interface LianbanStock {
   code: string; name: string; boards: number;
   price: number; pct: number; amount: number | null; float_cap: number | null; industry: string;
   reason: string;  // 涨停原因题材串（问财；缺 key/失败为空串）
+  close_status?: string;
+  traffic_light?: StockTrafficLight;
+}
+
+export interface KlineRow {
+  datetime?: string; date?: string;
+  open: number; close: number; high: number; low: number;
+  vol?: number; volume?: number; amount?: number | null;
+}
+
+export interface IndustryPeer {
+  code: string; name: string; price: number | null; pct: number | null;
+  amount: number | null; mcap: number | null; float_cap: number | null;
+  industry: string; is_focus?: boolean;
+}
+export interface IndustryPeers {
+  available: boolean; reason?: string;
+  board?: { code: string; name: string; basis: "industry" | "concept" };
+  quote_date?: string | null; focus_code?: string; total?: number;
+  members: IndustryPeer[]; source?: string;
+}
+export interface IntradayPoint { time: string; date?: string; label?: string; price: number; volume: number; pct?: number; }
+export interface IntradayLine {
+  code: string; date?: string | null; previous_close?: number | null;
+  points: IntradayPoint[]; reason?: string;
+}
+export interface IntradayBundle {
+  requested_date?: string | null; days?: number; source?: string;
+  series: Record<string, IntradayLine>;
 }
 export interface ShortTermEmotion {
   date: string;
@@ -200,11 +230,23 @@ export interface FirstBoardStock {
   code: string; name: string;
   price: number; pct: number; amount: number | null; float_cap: number | null;
   industry: string; seal_time: string; break_count: number; reason: string;
+  last_seal_time?: string; sealed_minutes?: number | null; seal_fund?: number | null;
+  turnover_pct?: number | null; traffic_light?: StockTrafficLight;
+  theme_group?: {
+    name: string; type: "theme" | "catalyst_only" | "missing"; basis: "event_tree";
+    member_count: number; catalysts: Array<{ name: string; member_count: number }>;
+  };
 }
 export interface FirstBoardData {
-  date: string; total_zt: number; first_count: number;
+  date: string; total_zt: number | null; first_count: number | null;
+  data_note?: string; finalized?: boolean; persisted_at?: string; retention_days?: number;
   reason_note: string | null;
   stocks: FirstBoardStock[];
+}
+export interface LimitGene {
+  available: boolean; reason?: string; window_days?: number; from?: string; to?: string;
+  limit_up_count?: number; touched_limit_count?: number; seal_success_rate?: number | null;
+  recent_60_limit_count?: number; stock_character_score?: number; source?: string; note?: string;
 }
 
 // 全市场成交额榜（客观公开榜单）
@@ -340,18 +382,107 @@ export interface LiveEmotion {
   promotion_rate?: number | null;
   /** 晋级率的分母：上一场的涨停家数 */
   promotion_base?: number | null;
+  two_board_count?: number;
   /** 分母是哪一场。两张卡都叫「晋级率」，而各自的「昨」不是同一天，所以把日期给出来写死 */
   promotion_base_date?: string | null;
+  lianban_stocks?: LianbanStock[];
+  emotion_regime?: EmotionRegime;
+}
+
+export interface LimitBreakEvent {
+  id: string; kind: "break" | "reseal"; code: string; name: string; at: string;
+  price: number; limit_up: number; break_count: number;
+}
+export interface LimitBreakState {
+  name: string; status: "watching" | "sealed" | "break";
+  break_count: number; last_event_at: string | null; price: number; limit_up: number;
+}
+export interface LimitBreakAlerts {
+  available: boolean; reason?: string; date?: string; as_of?: string;
+  states: Record<string, LimitBreakState>; events: LimitBreakEvent[];
+}
+
+export interface IwencaiStatus {
+  configured: boolean; source_priority: string[]; intraday_refresh_minutes: 0 | 30 | 60 | 120;
+  day: string; requests_today: number; successes_today: number; failures_today: number;
+  last_attempt_at: string | null; circuit_state: string; blocked_until: string | null;
+  circuit_reason: string | null;
+}
+export interface AppSettings {
+  iwencai_intraday_refresh_minutes: 0 | 30 | 60 | 120;
+  review_schedule: {
+    enabled: boolean; time: string; force: boolean; last_date: string | null;
+    last_triggered_at: string | null; last_status: "running" | "succeeded" | "failed" | null;
+    last_finished_at: string | null; last_error: string | null; last_elapsed: number | null;
+  };
+  iwencai: IwencaiStatus;
+}
+
+export type ValidationState = "pending" | "watching" | "satisfied" | "invalidated" | "insufficient_data" | "expired";
+export interface TodayCheckpoint {
+  key: string; time: string; label: string; state: "completed" | "missing" | "upcoming";
+  observed_at: string | null; history_key: string | null;
+}
+export interface TodayValidationItem {
+  id: string; metric: string; label: string; judgment: string; expected_direction: string;
+  baseline: number | null; threshold: number | null; unit: string; current_value: number | null;
+  actual_direction: string | null; status: ValidationState; status_label: string; evidence: string;
+  updated_at: string | null;
+  history: Array<{ status: ValidationState; at: string; snapshot: string; value: number | null; evidence: string }>;
+}
+export interface TodayTheme {
+  id: string; name: string; lifecycle: string; strength: number | null; coverage: number | null;
+  members: Array<{ code: string; name: string; pct?: number | null; boards?: number }>;
+  logic: string; risk: string; sample_size: number; complete: boolean;
+  data_status: "complete" | "partial" | "missing"; binding_basis: string[]; missing_reason: string;
+}
+export interface TodayValidationData {
+  available: boolean; reason?: string; schema_version?: number; prediction_date?: string; eval_date?: string;
+  observed_at?: string | null; stage?: string; editable?: boolean; eligible?: boolean; delayed?: boolean;
+  checkpoints?: TodayCheckpoint[]; summary?: Record<ValidationState | "total", number>;
+  validations?: TodayValidationItem[];
+  regime?: { phase?: string | null; phase_label: string; confidence: string; coverage: number; summary: string;
+    dimensions: Record<string, number | null>;
+    dimension_evidence?: Record<string, { key: string; score: number | null; raw_value: number | null; state: string; detail: string }>;
+    issues: string[] };
+  themes?: TodayTheme[];
+  feedback?: { total: number; classified?: number; unclassified?: number; complete?: boolean;
+    missing_sources?: string[]; reason?: string;
+    buckets: Array<{ label: string; count: number | null; ratio: number | null }>;
+    members: Array<{ code: string; name: string; pct?: number | null; boards?: number }> };
+  events?: Array<{ id: string; kind: string; title: string; occurred_at: string; severity: "info" | "watch" | "risk";
+    before: unknown; after: unknown; threshold: number | null; scope: string[]; evidence: string }>;
+  risks?: string[]; sources?: Record<string, { available?: boolean; reason?: string }>;
+  available_times?: string[];
 }
 
 export const api = {
   health: () => get<{ ok: boolean }>("/health"),
+  settings: () => get<AppSettings>("/settings"),
+  saveSettings: (settings: { iwencai_intraday_refresh_minutes: 0 | 30 | 60 | 120; review_schedule?: AppSettings["review_schedule"] }) =>
+    request<AppSettings>("/settings", "PUT", settings),
   indices: () => get<IndexQuote[]>("/indices"),
   marketSession: () => get<MarketSession>("/market/session"),
+  todayValidation: (date?: string, at?: string) => {
+    const params = new URLSearchParams();
+    if (date) params.set("date", date);
+    if (at) params.set("at", at);
+    const query = params.toString();
+    return get<TodayValidationData>(`/today-validation${query ? `?${query}` : ""}`);
+  },
   overseas: () => get<OverseasSnapshot>("/market/overseas"),
   liveEmotion: () => get<LiveEmotion>("/market/live-emotion"),
   marketOverview: () => get<MarketOverview>("/market/overview"),
   emotion: () => get<ShortTermEmotion>("/market/emotion"),
+  boardTrafficLight: (codes: string[], stockMode: "live" | "settled" = "live", date?: string) => {
+    const params = new URLSearchParams();
+    if (codes.length) params.set("codes", codes.join(","));
+    if (stockMode !== "live") params.set("stock_mode", stockMode);
+    if (date) params.set("date", date);
+    const query = params.toString();
+    return get<BoardTrafficLight>(`/market/board-traffic-light${query ? `?${query}` : ""}`);
+  },
+  limitBreakAlerts: (codes: string[]) => get<LimitBreakAlerts>(`/market/limit-break-alerts?codes=${encodeURIComponent(codes.join(","))}`),
   monitorSnapshot: async (watch: string) => {
     const codes = watch.split(',').filter(Boolean);
     const monitored = codes.slice(0, 100).join(',');
@@ -386,6 +517,18 @@ export const api = {
   financials: (code: string) => get<Financials>(`/financials?code=${code}`),
   announcements: (code: string) => get<Announcement[]>(`/announcements?code=${code}`),
   quote: (codes: string) => get<Record<string, Quote>>(`/quote?codes=${codes}`),
+  kline: (code: string, category = 4, offset = 120) => get<KlineRow[]>(
+    `/kline?code=${encodeURIComponent(code)}&category=${category}&offset=${offset}`,
+  ),
+  industryPeers: (industry: string, code: string, limit = 300) => get<IndustryPeers>(
+    `/market/industry-peers?industry=${encodeURIComponent(industry)}&code=${encodeURIComponent(code)}&limit=${limit}`,
+  ),
+  conceptPeers: (concept: string, code = "", limit = 30) => get<IndustryPeers>(
+    `/market/concept-peers?concept=${encodeURIComponent(concept)}&code=${encodeURIComponent(code)}&limit=${limit}`,
+  ),
+  intraday: (codes: string[], date?: string | null, days = 1) => get<IntradayBundle>(
+    `/market/intraday?codes=${encodeURIComponent(codes.join(","))}${date ? `&date=${encodeURIComponent(date)}` : ""}&days=${Math.max(1, Math.min(5, days))}`,
+  ),
   reports: (code: string) => get<Report[]>(`/reports?code=${code}`),
   news: (code: string) => get<NewsItem[]>(`/news?code=${code}`),
   margin: (code: string) => get<MarginRow[]>(`/margin?code=${code}`),
@@ -393,7 +536,7 @@ export const api = {
   holders: (code: string) => get<HolderRow[]>(`/holders?code=${code}`),
   dividend: (code: string) => get<DividendRow[]>(`/dividend?code=${code}`),
   fundFlow: (code: string) => get<FundFlowRow[]>(`/fund-flow?code=${code}`),
-  dragonTiger: (code: string) => get<DragonTiger>(`/dragon-tiger?code=${code}`),
+  dragonTiger: (code: string, date?: string) => get<DragonTiger>(`/dragon-tiger?code=${code}${date ? `&date=${encodeURIComponent(date)}` : ""}`),
   unlockCalendar: (window: "upcoming" | "recent") => get<UnlockCalendar>(`/lockup-calendar?window=${window}`),
   lockup: (code: string) => get<Lockup>(`/lockup?code=${code}`),
   blocks: (code: string) => get<Blocks>(`/blocks?code=${code}`),

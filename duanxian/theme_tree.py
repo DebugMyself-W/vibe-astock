@@ -45,7 +45,7 @@ from .cache_policy import fresh as cache_fresh, write as write_cache
 
 import json
 import os
-from typing import Optional
+from typing import Iterable, Optional
 
 from . import trade_calendar
 from .util import atomic_write_json
@@ -59,6 +59,12 @@ _GENERIC = {
 }
 # 地方国资类（xx国资 / xx国企）也属于属性词，用后缀判
 _GENERIC_SUFFIX = ("国资", "国企", "板块")
+_CATALYSTS = {
+    "业绩增长", "业绩预增", "业绩扭亏", "扭亏为盈", "业绩改善",
+    "中报增长", "年报增长", "季报增长", "预增", "减亏",
+    "回购", "增持", "股东增持", "定增募资", "获得订单", "中标",
+}
+_CATALYST_MARKERS = ("业绩预增", "业绩增长", "扭亏", "减亏", "回购", "增持", "定增募资")
 
 
 def _is_generic(tag: str) -> bool:
@@ -110,6 +116,68 @@ def _tags(reason: str) -> list[str]:
         if t and not _is_generic(t):
             out.append(t)
     return out
+
+
+def tag_kind(tag: str) -> str:
+    """Return event-tree semantics: theme, catalyst, or attribute."""
+    tag = str(tag or "").strip()
+    if not tag or _is_generic(tag):
+        return "attribute"
+    if tag in _CATALYSTS or any(marker in tag for marker in _CATALYST_MARKERS):
+        return "catalyst"
+    return "theme"
+
+
+def primary_direction_groups(rows: Iterable[dict], reasons: dict[str, str]) -> tuple[dict[str, dict], dict[str, list[dict]]]:
+    """Derive one visible/scorable primary theme per stock from event-tree tags."""
+    source_rows = [row for row in rows if isinstance(row, dict)]
+    parsed: dict[str, list[str]] = {}
+    theme_counts: dict[str, int] = {}
+    catalyst_counts: dict[str, int] = {}
+    for row in source_rows:
+        code = str(row.get("code") or "").zfill(6)
+        tags = list(dict.fromkeys(_tags(reasons.get(code, ""))))
+        parsed[code] = tags
+        for tag in tags:
+            counts = catalyst_counts if tag_kind(tag) == "catalyst" else theme_counts
+            counts[tag] = counts.get(tag, 0) + 1
+
+    member_keys = ("code", "name", "seal_time", "last_seal_time", "break_count", "industry")
+    theme_groups: dict[str, list[dict]] = {}
+    for row in source_rows:
+        code = str(row.get("code") or "").zfill(6)
+        for tag in parsed.get(code, []):
+            if tag_kind(tag) == "theme":
+                theme_groups.setdefault(tag, []).append({key: row.get(key) for key in member_keys})
+
+    directions: dict[str, dict] = {}
+    for row in source_rows:
+        code = str(row.get("code") or "").zfill(6)
+        tags = parsed.get(code, [])
+        themes = [tag for tag in tags if tag_kind(tag) == "theme"]
+        catalysts = [{"name": tag, "member_count": catalyst_counts.get(tag, 0)}
+                     for tag in tags if tag_kind(tag) == "catalyst"]
+        if themes:
+            name = max(themes, key=lambda tag: theme_counts.get(tag, 0))
+            directions[code] = {"name": name, "type": "theme", "basis": "event_tree",
+                                "member_count": len(theme_groups.get(name, [])), "catalysts": catalysts}
+        elif catalysts:
+            directions[code] = {"name": catalysts[0]["name"], "type": "catalyst_only",
+                                "basis": "event_tree", "member_count": 0, "catalysts": catalysts}
+        else:
+            directions[code] = {"name": "", "type": "missing", "basis": "event_tree",
+                                "member_count": 0, "catalysts": []}
+    return directions, theme_groups
+
+
+def annotate_kinds(tree: dict) -> dict:
+    """Add theme/catalyst semantics to legacy frozen trees without rewriting history."""
+    if not isinstance(tree, dict) or not isinstance(tree.get("themes"), list):
+        return tree
+    return {**tree, "themes": [
+        {**node, "kind": tag_kind(node.get("tag"))} if isinstance(node, dict) else node
+        for node in tree["themes"]
+    ]}
 
 
 def build(date: str, prev: Optional[str] = None, top: int = 10) -> dict:

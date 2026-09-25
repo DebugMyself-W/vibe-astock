@@ -161,6 +161,13 @@ _MIN_SIGNALS = 2
 _EVAL_SCHEMA = 2
 
 
+def _review_phase(review: Optional[dict]) -> Optional[str]:
+    """New reviews use the deterministic phase; old files keep the AI fallback."""
+    review = review or {}
+    phase = (review.get("emotion_regime") or {}).get("phase")
+    return phase or (review.get("focus") or {}).get("emotion_phase")
+
+
 def _delta_dir(cur: Optional[float], prev: Optional[float], eps: float) -> Optional[int]:
     """比较两个读数的方向：+1 升 / 0 基本持平 / -1 降；任一缺失返回 None。
 
@@ -182,7 +189,7 @@ def evaluate_phase(prediction_date: str, eval_date: str) -> Optional[dict]:
     三路信号：晋级率 / 赚钱效应中位数 / 涨停家数，各投一票取多数。
     """
     review = _load_review(prediction_date)
-    phase = ((review or {}).get("focus") or {}).get("emotion_phase")
+    phase = _review_phase(review)
     expect = _PHASE_EXPECT.get(phase or "")
     if not expect:
         return None
@@ -305,7 +312,7 @@ def evaluate(prediction_date: str, eval_date: Optional[str] = None) -> Optional[
         "eval_schema": _EVAL_SCHEMA,
         "prediction_date": prediction_date,
         "eval_date": eval_date,
-        "emotion_phase": focus.get("emotion_phase"),
+        "emotion_phase": _review_phase(review),
         "directions": dirs_eval,
         "overall_next_ret": overall,
         "direction_hit_rate": hit_rate,

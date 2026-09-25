@@ -80,6 +80,16 @@ def _rate(hit: int, total: int) -> Optional[float]:
     return round(hit / total, 4) if total else None
 
 
+def current_limit_pool() -> tuple[Optional[str], Optional[list[dict]]]:
+    """Return the actual quote session and its cached limit-up pool."""
+    day = trade_calendar.quote_trade_day() or trade_calendar.latest_session()
+    if not day:
+        return None, None
+    pool = _cached(f"zt:{day}", _TODAY_TTL,
+                   lambda: _pool("getTopicZTPool", day.replace("-", "")))
+    return day, pool if isinstance(pool, list) else None
+
+
 def snapshot() -> dict:
     """今日实时打板情绪。非交易时段 / 取不到数据 → available=False 并说明原因。"""
     today = china_now().strftime("%Y-%m-%d")

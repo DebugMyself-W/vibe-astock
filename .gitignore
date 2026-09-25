@@ -6,10 +6,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.tmpdeps/
 
 # ---- 前端 ----
 node_modules
 dist/
+dist-*/
 .vite/
 
 # ---- 凭据 / 本机配置 ----

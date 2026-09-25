@@ -1,8 +1,9 @@
 import { useEffect, useId, useState } from "react";
 import { HelpCircle } from "lucide-react";
 import { plain } from "@/lib/agent";
+import { cn } from "@/lib/utils";
 
-export function Caliber({ text }: { text: string }) {
+export function Caliber({ text, mobileCentered = false }: { text: string; mobileCentered?: boolean }) {
   const [open, setOpen] = useState(false);
   const panelId = useId();
 
@@ -34,7 +35,10 @@ export function Caliber({ text }: { text: string }) {
             id={panelId}
             role="note"
             aria-label="口径说明"
-            className="absolute left-0 top-full z-50 mt-1 block w-[min(30rem,80vw)] whitespace-pre-line rounded-lg border border-border bg-background p-3 text-[11px] leading-relaxed text-foreground shadow-xl ring-1 ring-black/5"
+            className={cn("z-50 block w-[min(30rem,80vw)] whitespace-pre-line rounded-lg border border-border bg-background p-3 text-[11px] leading-relaxed text-foreground shadow-xl ring-1 ring-black/5",
+              mobileCentered
+                ? "fixed left-1/2 top-1/2 max-h-[80dvh] -translate-x-1/2 -translate-y-1/2 overflow-y-auto sm:absolute sm:left-0 sm:top-full sm:mt-1 sm:translate-x-0 sm:translate-y-0"
+                : "absolute left-0 top-full mt-1")}
           >
             {}
             {plain(text)}

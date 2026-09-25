@@ -50,7 +50,20 @@ def _asof_note(date: str) -> str:
 
 
 # ============ ① 情绪面 ============
-def get_sentiment_data(date: str) -> str:
+def get_sentiment_data(date: str, existing_metrics: Optional[dict] = None,
+                       existing_facts: Optional[dict] = None) -> str:
+    """盘口摘要；增量复盘优先从已定稿的结构化事实重建，避免重复拉三池。"""
+    metrics = existing_metrics if isinstance(existing_metrics, dict) else {}
+    facts = existing_facts if isinstance(existing_facts, dict) else {}
+    promotion = metrics.get("promotion") or {}
+    ladder = metrics.get("ladder_gap") or {}
+    seal = facts.get("seal_quality") or {}
+    loss = facts.get("loss_effect") or {}
+    if (promotion.get("available") is True and ladder.get("available") is True
+            and seal.get("available") is True and loss.get("available") is True):
+        return (f"[已存定稿数据 {date}] 涨停 {promotion.get('limit_up_count', seal.get('total', '—'))} 家；"
+                f"炸板率 {seal.get('broken_rate', '—')}；最高连板 {ladder.get('highest', '—')} 板。"
+                "增量复盘复用了已有盘口数据，仅补取缺失字段。")
     try:
         zt = dr.fetch_zt_pool(_ymd(date))
         ztdf = zt.get("zt")
@@ -72,18 +85,18 @@ def get_sentiment_data(date: str) -> str:
         return _degrade("情绪面", date, exc)
 
 
-def get_emotion_metrics(date: str) -> tuple[str, dict]:
+def get_emotion_metrics(date: str, existing: Optional[dict] = None) -> tuple[str, dict]:
     """派生情绪指标（赚钱效应 / 晋级率 / 连板溢价）"""
     try:
         from . import emotion_metrics as em
 
-        m = em.build_metrics(date)
+        m = em.build_metrics(date, existing=existing)
         return em.render_metrics(m), m
     except Exception as exc:  # noqa: BLE001
         return _degrade("派生情绪指标", date, exc), {}
 
 
-def get_market_facts(date: str) -> tuple[str, dict]:
+def get_market_facts(date: str, existing: Optional[dict] = None) -> tuple[str, dict]:
     """客观事实表（封板质量 / 亏钱效应 / 反馈矩阵 / 题材结构 / 事件账本 / 分板块）。
 
     与 `get_emotion_metrics` 一样返回 **(文本块, 结构化 dict)**：文本喂 prompt，
@@ -100,18 +113,32 @@ def get_market_facts(date: str) -> tuple[str, dict]:
 
         from . import breadth as bd
 
+        from . import trade_calendar
+
+        previous_date = trade_calendar.prev_trade_date(date)
+
+        existing = existing if isinstance(existing, dict) else {}
+
+        def reuse(key: str, fetch):
+            value = existing.get(key)
+            if isinstance(value, dict) and value.get("available") is True:
+                return value
+            return fetch()
+
         facts = {
-            "breadth": bd.market_breadth(date),
-            "stats_context": sctx.context_for(date),
-            "day_diff": sctx.diff(date),
-            "trend": sctx.trend(10, end=date),
-            "theme_tree": tt.build(date),
-            "seal_quality": mf.seal_quality(date),
-            "loss_effect": mf.loss_effect(date),
-            "feedback_matrix": mf.feedback_matrix(date),
-            "theme_structure": mf.theme_structure(date),
-            "event_ledger": mf.event_ledger(date),
-            "by_board": mf.by_board(date),
+            "breadth": reuse("breadth", lambda: bd.market_breadth(date)),
+            "previous_breadth": reuse("previous_breadth", lambda: bd.market_breadth(previous_date) if previous_date else {}),
+            "indices": reuse("indices", lambda: dr.fetch_a_index_day(date)),
+            "stats_context": reuse("stats_context", lambda: sctx.context_for(date)),
+            "day_diff": reuse("day_diff", lambda: sctx.diff(date)),
+            "trend": reuse("trend", lambda: sctx.trend(10, end=date)),
+            "theme_tree": reuse("theme_tree", lambda: tt.build(date)),
+            "seal_quality": reuse("seal_quality", lambda: mf.seal_quality(date)),
+            "loss_effect": reuse("loss_effect", lambda: mf.loss_effect(date)),
+            "feedback_matrix": reuse("feedback_matrix", lambda: mf.feedback_matrix(date)),
+            "theme_structure": reuse("theme_structure", lambda: mf.theme_structure(date)),
+            "event_ledger": reuse("event_ledger", lambda: mf.event_ledger(date)),
+            "by_board": reuse("by_board", lambda: mf.by_board(date)),
         }
         return render_market_facts(facts), facts
     except Exception as exc:  # noqa: BLE001
@@ -286,7 +313,10 @@ def get_macro_sector_data(date: str) -> str:
 # ============ ③ 题材热点（涨停原因题材串）============
 def get_theme_reasons(date: str) -> str:
     try:
-        reasons, err = dr.fetch_zt_reasons(_ymd(date))
+        # Reuse the exact event-tree result instead of spending another page query.
+        from .theme_reasons import get_reasons
+
+        reasons, err = get_reasons(date)
         if not reasons:
             return _degrade_msg("题材涨停原因", date, f"涨停原因题材串未取到：{err}")
         tags = Counter()

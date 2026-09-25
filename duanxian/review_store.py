@@ -116,6 +116,11 @@ def _save_unlocked(payload: dict, date: str) -> SaveResult:
         _atomic_write(dated, payload)
         if not current or (current.get("target_date") or current.get("trade_date") or "") <= date:
             _atomic_write(latest, payload)
+        try:
+            from .followup_store import capture_saved
+            capture_saved(payload, date)
+        except Exception as exc:  # noqa: BLE001 - follow-up must not invalidate a saved review
+            print(f"⚠️ 次日跟踪快照未生成：{type(exc).__name__}: {exc}")
         return SaveResult(True)
 
     kept: list[str] = []
@@ -162,11 +167,63 @@ def _with_baselines(env: dict | None) -> dict | None:
         env.get("emotion_metrics") or {}, env.get("market_facts") or {})}}
 
 
+def _previous_regime(date: str | None) -> dict | None:
+    if not date:
+        return None
+    candidates = sorted(
+        (p for p in Path(DIR).glob("*.json") if len(p.stem) == 10 and p.stem < date),
+        key=lambda p: p.stem,
+        reverse=True,
+    )
+    if not candidates:
+        return None
+    previous = _read(str(candidates[0]))
+    if not isinstance(previous, dict):
+        return None
+    from .emotion_regime import evaluate_settled
+    return evaluate_settled(previous)
+
+
+def _with_regime(env: dict | None) -> dict | None:
+    if not isinstance(env, dict) or isinstance(env.get("emotion_regime"), dict):
+        return env
+    from .emotion_regime import evaluate_settled
+    date = env.get("target_date") or env.get("trade_date")
+    return {**env, "emotion_regime": evaluate_settled(env, _previous_regime(date))}
+
+
+def _with_entry(env: dict | None) -> dict | None:
+    if not isinstance(env, dict) or isinstance(env.get("entry_decision"), dict):
+        return env
+    from .entry_decision import evaluate_entry
+    return {**env, "entry_decision": evaluate_entry(env)}
+
+
+def _with_traffic_light(env: dict | None) -> dict | None:
+    if not isinstance(env, dict) or isinstance(env.get("board_traffic_light"), dict):
+        return env
+    return env
+
+
+def _with_theme_kinds(env: dict | None) -> dict | None:
+    if not isinstance(env, dict):
+        return env
+    facts = env.get("market_facts")
+    tree = facts.get("theme_tree") if isinstance(facts, dict) else None
+    if not isinstance(tree, dict):
+        return env
+    from .theme_tree import annotate_kinds
+    return {**env, "market_facts": {**facts, "theme_tree": annotate_kinds(tree)}}
+
+
 def load(date: str | None = None) -> dict | None:
     """读某天的复盘；`date=None` 读 latest。文件损坏当不存在处理（不抛）。"""
     name = "latest.json" if date is None else f"{date}.json"
     path = safe_join(DIR, name)
-    return _with_baselines(_read(path)) if os.path.exists(path) else None
+    if not os.path.exists(path):
+        return None
+    env = _with_regime(_with_baselines(_read(path)))
+    return _with_theme_kinds(_with_traffic_light(_with_entry(env)))
 
 
 def dates() -> list[str]:
@@ -224,7 +281,7 @@ def serialize(final: dict, date: str, extra_warnings: list[str] | None = None) -
         analysts.append({"key": role.key, "title": role.title, "tag": role.tag, "html": md_to_html(raw)})
     macro = final.get("macro_sector_report", "") or ""
     now = china_now().strftime("%Y-%m-%d %H:%M") + " CST"
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "run_type": "daily_review",
         "review_id": f"daily_{date}",
@@ -241,3 +298,7 @@ def serialize(final: dict, date: str, extra_warnings: list[str] | None = None) -
         "reflection": reflection.latest_reflection(end=date),   # 反思闭环：上期命中回看
         "analysts": analysts,
     }
+    payload = _with_regime(payload) or payload
+    from .board_traffic_light import evaluate_settled, attach_feedback_stock_lights
+    payload = _with_entry({**payload, "board_traffic_light": evaluate_settled(payload)}) or payload
+    return attach_feedback_stock_lights(payload)
