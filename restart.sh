@@ -10,6 +10,10 @@ RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp}/vibe-astock-${UID}"
 PID_FILE="${RUNTIME_BASE}/server-${PORT}.pid"
 LOG_FILE="${RUNTIME_BASE}/server-${PORT}.log"
 
+# shellcheck source=scripts/proxy_env.sh
+source "${ROOT_DIR}/scripts/proxy_env.sh"
+normalize_vibe_proxy_env
+
 if [[ ! "${PORT}" =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
   echo "Invalid VIBE_PORT: ${PORT}" >&2
   exit 2
