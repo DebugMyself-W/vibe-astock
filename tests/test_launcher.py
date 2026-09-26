@@ -14,6 +14,26 @@ from scripts import manage
 REAL_CONNECT = socket.socket.connect
 
 
+def test_restart_fails_fast_when_agent_dependency_is_missing():
+    source = Path("restart.sh").read_text(encoding="utf-8")
+    assert "-c 'import mcp'" in source
+    assert "Run scripts/setup after updating the source" in source
+
+
+def test_core_requirements_keep_mcp_installable():
+    requirements = Path("requirements.txt").read_text(encoding="utf-8")
+    body = "\n".join(
+        line.strip().lower()
+        for line in requirements.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    assert "mcp==1.26.0" in body
+    assert not any(line.startswith("mootdx") for line in body.splitlines()), (
+        "mootdx 0.11.x pins httpx<0.26 while MCP requires httpx>=0.27.1; "
+        "keep the legacy market client out of the core Agent environment"
+    )
+
+
 @pytest.mark.parametrize("stdout,code,expected", [
     ('ASTOCK_IMPORTS=[]', 0, True),
     ('ASTOCK_IMPORTS=["akshare: ModuleNotFoundError"]', 0, False),

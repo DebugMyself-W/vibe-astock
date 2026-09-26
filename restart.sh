@@ -30,6 +30,11 @@ else
   exit 2
 fi
 
+if ! "${PYTHON_BIN}" -c 'import mcp' >/dev/null 2>&1; then
+  echo "Python dependency 'mcp' is missing. Run scripts/setup after updating the source." >&2
+  exit 2
+fi
+
 if ! command -v npm >/dev/null 2>&1; then
   echo "npm not found in PATH." >&2
   exit 2
