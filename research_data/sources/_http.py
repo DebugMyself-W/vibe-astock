@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common import UA, em_get as _em_get, save_raw  # noqa: E402
+from net_utils import market_session, market_urlopen  # noqa: E402
 
 
 @dataclass
@@ -106,13 +107,12 @@ _lock = threading.Lock()
 
 
 def _session(trust_env: bool = True):
-    import requests
-
-    key = f"s{int(trust_env)}"
+    # ``trust_env`` remains in the signature for source compatibility; the
+    # unified market policy owns routing now.
+    key = "market"
     with _lock:
         if key not in _sessions:
-            s = requests.Session()
-            s.trust_env = trust_env
+            s = market_session()
             s.headers.update({"User-Agent": UA})
             _sessions[key] = s
         return _sessions[key]
@@ -173,7 +173,7 @@ def em_json(url: str, **kw) -> Any:
 def urlopen_bytes(url: str, headers: Optional[dict] = None, timeout: int = 15, ext: str = "txt") -> bytes:
     """标准库取原文(上游若干脚本用 urllib),同样落盘。"""
     req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with market_urlopen(req, timeout=timeout) as resp:
         data = resp.read()
     cap = _current.get()
     if cap is not None:
@@ -276,11 +276,9 @@ _yahoo = {"session": None, "crumb": None}
 
 
 def yahoo_session():
-    import requests
-
     if _yahoo["session"] is not None and _yahoo["crumb"]:
         return _yahoo["session"], _yahoo["crumb"]
-    s = requests.Session()
+    s = market_session()
     s.headers["User-Agent"] = UA
     s.get("https://fc.yahoo.com", timeout=10)
     r = s.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=10)

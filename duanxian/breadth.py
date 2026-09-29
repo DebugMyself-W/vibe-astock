@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import time
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -31,6 +32,10 @@ _PROBE_SPAN = 3                                # 探到空页时向两侧最多�
 _TIMEOUT = 25
 
 _INDEX_IDS = ("1.000001", "0.399001")
+
+_SINA_LIST = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
+_SINA_COUNT = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeStockCount"
+_SINA_PZ = 100
 
 
 def _get(url: str, retries: int = 2) -> dict:
@@ -96,6 +101,119 @@ def _page(pn: int) -> tuple[int, list[float]]:
     vals = [float(x["f3"]) for x in diff
             if isinstance(x, dict) and isinstance(x.get("f3"), (int, float))]
     return total, vals, len(diff)
+
+
+def _sina_json(url: str, params: dict) -> object:
+    query = urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        f"{url}?{query}",
+        headers={"User-Agent": _UA["User-Agent"], "Referer": "https://finance.sina.com.cn/"},
+    )
+    with market_urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def _sina_page(page: int, descending: bool) -> tuple[list[float], int]:
+    payload = _sina_json(_SINA_LIST, {
+        "page": page, "num": _SINA_PZ, "sort": "changepercent",
+        "asc": 0 if descending else 1, "node": "hs_a", "symbol": "", "_s_r_a": "page",
+    })
+    if not isinstance(payload, list):
+        raise ValueError(f"新浪第 {page} 页响应不是列表")
+    values = []
+    for row in payload:
+        if not isinstance(row, dict) or row.get("changepercent") in (None, ""):
+            continue
+        try:
+            value = float(row["changepercent"])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return values, len(payload)
+
+
+def _sina_prefix_count(total: int, predicate, *, descending: bool, calls: list[int],
+                       cache: dict[int, tuple[list[float], int]] | None = None) -> int:
+    """Count the true prefix in a reliably sorted Sina market list."""
+    max_page = max(1, (total + _SINA_PZ - 1) // _SINA_PZ)
+    lo, hi = 1, max_page + 1
+    page_cache = cache if cache is not None else {}
+
+    def page(number: int) -> tuple[list[float], int]:
+        if number not in page_cache:
+            page_cache[number] = _sina_page(number, descending)
+            calls[0] += 1
+        values, raw = page_cache[number]
+        expected = _SINA_PZ if number < max_page else total - (max_page - 1) * _SINA_PZ
+        if raw != expected or len(values) != raw:
+            raise ValueError(f"新浪第 {number} 页行数不完整：{raw}/{expected}")
+        return values, raw
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+        values, _ = page(mid)
+        if values and predicate(values[-1]):
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo == max_page + 1:
+        return total
+    values, _ = page(lo)
+    return (lo - 1) * _SINA_PZ + sum(1 for value in values if predicate(value))
+
+
+def _sina_distribution() -> dict:
+    """Independent Shanghai/Shenzhen breadth fallback from sorted Sina pages."""
+    calls = [0]
+    raw_total = _sina_json(_SINA_COUNT, {"node": "hs_a"})
+    calls[0] += 1
+    try:
+        total = int(raw_total)
+    except (TypeError, ValueError):
+        raise ValueError(f"新浪全市场只数不合法：{raw_total!r}") from None
+    if total <= 0:
+        raise ValueError(f"新浪全市场只数不合法：{total}")
+    ascending: dict[int, tuple[list[float], int]] = {}
+    descending: dict[int, tuple[list[float], int]] = {}
+    down5 = _sina_prefix_count(
+        total, lambda value: value < -5.0, descending=False, calls=calls, cache=ascending,
+    )
+    down = _sina_prefix_count(
+        total, lambda value: value < 0, descending=False, calls=calls, cache=ascending,
+    )
+    nonpositive = _sina_prefix_count(
+        total, lambda value: value <= 0, descending=False, calls=calls, cache=ascending,
+    )
+    up5 = _sina_prefix_count(
+        total, lambda value: value >= 5.0, descending=True, calls=calls, cache=descending,
+    )
+    return {
+        "universe": total,
+        "up": total - nonpositive,
+        "down": down,
+        "flat": nonpositive - down,
+        "deep_up_5_incl": up5,
+        "deep_down_5": down5,
+        "source": "sina_market_center",
+        "requests": calls[0],
+    }
+
+
+def _tencent_index_amount(date: str) -> float:
+    """Return the same-date Shanghai + Shenzhen turnover from Tencent indices."""
+    from vr.astock import _fetch_gtimg, _parse_gtimg
+
+    quotes = _parse_gtimg(_fetch_gtimg(["sh000001", "sz399001"]))
+    expected = date.replace("-", "")
+    rows = [quotes.get("000001") or {}, quotes.get("399001") or {}]
+    if any(str(row.get("quote_time") or "")[:8] != expected for row in rows):
+        actual = sorted({str(row.get("quote_time") or "")[:8] for row in rows})
+        raise ValueError(f"腾讯指数行情日不匹配：期望 {expected}，实际 {actual}")
+    amounts = [row.get("amount_wan") for row in rows]
+    if not all(_num_ok(value) and value > 0 for value in amounts):
+        raise ValueError("腾讯指数成交额不完整")
+    return round(sum(amounts) / 10000, 1)
 
 
 def _rank_below(total: int, thr: float, calls: list) -> Optional[int]:
@@ -192,50 +310,95 @@ def market_breadth(date: str) -> dict:
     返回里 `available=False` 时一定带 `reason` —— **绝不用 0 或空充数**。
     """
     path = _cache_path(date)
+    cached_data = None
     if os.path.isfile(path):
         try:
             with open(path, encoding="utf-8") as fh:
                 env = json.load(fh)
             if (isinstance(env, dict) and env.get("schema") == _SCHEMA
                     and env.get("date") == date and _payload_ok(env.get("data"))):
-                return env["data"]
+                cached_data = env["data"]
+                if cached_data.get("dist_available"):
+                    return cached_data
         except Exception:  # noqa: BLE001  缓存坏了当没有，重新取
             pass
 
     ok, why = trade_calendar.live_quotes_are_close_of(date)
     if not ok:
+        if cached_data is not None:
+            return cached_data
         return {"available": False, "reason": why}
 
     calls = [0]
+    independent = None
+    up_down_source = "eastmoney_index_width"
+    up_down_scope = "沪深两市（不含北交所）"
     idx = _index_breadth()
     calls[0] += 1
     if idx is None:
-        return {"available": False, "reason": "取全市场涨跌家数失败（数据源不可用）"}
+        if cached_data is not None:
+            idx = {key: cached_data[key] for key in ("up", "down", "flat", "amount_yi")}
+            up_down_source = str(cached_data.get("up_down_source") or "settled_cache")
+            up_down_scope = str(cached_data.get("up_down_scope") or up_down_scope)
+        else:
+            try:
+                independent = _sina_distribution()
+                idx = {key: independent[key] for key in ("up", "down", "flat")}
+                idx["amount_yi"] = _tencent_index_amount(date)
+                up_down_source = "sina_market_center+tencent_indices"
+                up_down_scope = "沪深 A 股（新浪行情中心）"
+                calls[0] += int(independent.get("requests") or 0) + 1
+            except Exception as exc:  # noqa: BLE001 - both sources must agree on the target close
+                logger.warning("涨跌家数独立备用源失败：%s: %s", type(exc).__name__, exc)
+                return {
+                    "available": False,
+                    "reason": "取全市场涨跌家数失败（东财主源与新浪/腾讯备用源均不可用）",
+                }
 
-    total = 0
-    try:
-        total, _, _ = _page(1)
-        calls[0] += 1
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("取全市场只数失败，分布这几项本次不给：%s: %s", type(exc).__name__, exc)
+    total = int(independent.get("universe") or 0) if independent else 0
+    down5 = independent.get("deep_down_5") if independent else None
+    up5 = independent.get("deep_up_5_incl") if independent else None
+    dist_source = independent.get("source") if independent else None
 
-    down5 = _rank_below(total, -5.0, calls) if total else None
-    up5_below = _rank_below(total, 5.0, calls) if total else None
-    up5 = (total - up5_below) if (total and up5_below is not None) else None
+    if independent is None:
+        try:
+            total, _, _ = _page(1)
+            calls[0] += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("取全市场只数失败，分布这几项本次不给：%s: %s", type(exc).__name__, exc)
+
+        down5 = _rank_below(total, -5.0, calls) if total else None
+        up5_below = _rank_below(total, 5.0, calls) if total else None
+        up5 = (total - up5_below) if (total and up5_below is not None) else None
+        dist_source = "eastmoney_clist" if any(value is not None for value in (up5, down5)) else None
+
+    if up5 is None or down5 is None:
+        try:
+            fallback = _sina_distribution()
+            total = fallback["universe"]
+            up5 = fallback["deep_up_5_incl"]
+            down5 = fallback["deep_down_5"]
+            dist_source = fallback["source"]
+            calls[0] += fallback["requests"]
+        except Exception as exc:  # noqa: BLE001 - 保留主源已成功的部分，绝不补零
+            logger.warning("新浪涨跌分布备用源失败：%s: %s", type(exc).__name__, exc)
 
     out = {
         "available": True,
         "date": date,
         # 沪深两市（不含北交所）—— 口径如实写出来，别声称"全市场"
         "up": idx["up"], "down": idx["down"], "flat": idx["flat"],
-        "up_down_scope": "沪深两市（不含北交所）",
+        "up_down_scope": up_down_scope,
+        "up_down_source": up_down_source,
         "amount_yi": idx["amount_yi"],
-        # 下面三项是全 A（含北交所）的排名统计
+        # 极端涨跌分布的市场范围由 dist_scope 明示；备用源只覆盖沪深 A 股。
         "universe": total,
         "deep_up_5_incl": up5, "deep_down_5": down5,
-        "dist_scope": "全 A（含北交所）",
+        "dist_scope": ("沪深 A 股（新浪行情中心）"
+                       if dist_source == "sina_market_center" else "全 A（含北交所）"),
         "dist_available": any(v is not None for v in (up5, down5)),
         "dist_partial": any(v is None for v in (up5, down5)),
+        "dist_source": dist_source,
         "requests": calls[0],
     }
     if trade_calendar.is_settled(date):

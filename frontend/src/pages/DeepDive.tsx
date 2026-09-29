@@ -1,7 +1,7 @@
 import { randomId } from "@/lib/random-id";
 import { useSearchParams } from 'react-router-dom';
 import { useEffect, useRef, useState } from "react";
-import { Microscope, Loader2, Target, Square } from "lucide-react";
+import { Microscope, Loader2, Target, Square, History, ChevronDown, ChevronUp, Trash2 } from "lucide-react";
 import { agentRequest, AgentRequestError, loadAgentConnection, type AgentConnection } from "@/lib/agent-api";
 import { useWorkspace } from "@/lib/workspace/state";
 import { AgentChat } from "@/components/AgentChat";
@@ -9,6 +9,17 @@ import { agentFetch, safeArray, type DeepDiveData, type JobStatus } from "@/lib/
 
 const DISCLAIMER =
   "本页由多 agent AI 基于公开数据现场生成，结论为 AI 判断，仅供参考，不构成投资建议；市场有风险，决策与盈亏自负。";
+
+type DeepDiveReportSummary = {
+  job_id: string;
+  code: string;
+  name: string;
+  generated_at: string;
+  trade_date?: string;
+  ai_source?: { provider?: string; model?: string };
+};
+type DeepDiveHistory = { total: number; reports: DeepDiveReportSummary[] };
+type DeepDiveDeleteResult = DeepDiveHistory & { deleted_job_id: string; latest_job_id: string };
 
 export function DeepDive() {
   const workspace = useWorkspace();
@@ -27,6 +38,12 @@ export function DeepDive() {
   const [stage, setStage] = useState("");
   const [jobId, setJobId] = useState("");
   const [recovery, setRecovery] = useState(false);
+  const [loadingLatest, setLoadingLatest] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [loadingReportId, setLoadingReportId] = useState("");
+  const [deletingReportId, setDeletingReportId] = useState("");
+  const [history, setHistory] = useState<DeepDiveHistory>({ total: 0, reports: [] });
   const polling = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const alive = useRef(true);
@@ -37,12 +54,84 @@ export function DeepDive() {
   type Pending = { stock: string; request_id: string; llm: AgentConnection };
   const pendingKey = "astock-deepdive-pending";
 
-  async function loadLatest() {
+  async function loadLatest(notify = false) {
     const revision = ++displayRevision.current;
     try {
       const d = await agentFetch<DeepDiveData>("/api/deepdive/latest");
-      if (alive.current && revision === displayRevision.current && d?.code) setData(d);
+      if (alive.current && revision === displayRevision.current && d?.code) {
+        setData(d); setSection("summary");
+        if (notify) setMsg(`已加载最近完成报告：${d.name || d.code}（${d.code}）`);
+        return true;
+      }
+      if (alive.current && notify) setMsg("尚无已完成的深挖报告");
     } catch { if (alive.current) setMsg("读取上次深挖失败；原报告仍保留"); }
+    return false;
+  }
+
+  async function showLatest() {
+    target.current = "";
+    sessionStorage.removeItem(acceptedKey);
+    setLoadingLatest(true); setMsg("");
+    try { await loadLatest(true); }
+    finally { if (alive.current) setLoadingLatest(false); }
+  }
+
+  async function toggleHistory() {
+    if (historyOpen) { setHistoryOpen(false); return; }
+    setHistoryOpen(true); setHistoryLoading(true); setMsg("");
+    try {
+      const value = await agentRequest<DeepDiveHistory>("/deepdive/reports");
+      if (alive.current) setHistory(value);
+    } catch (error) {
+      if (alive.current) setMsg(error instanceof Error ? error.message : "历史报告读取失败");
+    } finally {
+      if (alive.current) setHistoryLoading(false);
+    }
+  }
+
+  async function loadHistoricalReport(report: DeepDiveReportSummary) {
+    const revision = ++displayRevision.current;
+    setLoadingReportId(report.job_id); setMsg("");
+    try {
+      const loaded = await agentRequest<DeepDiveData>(`/deepdive/reports/${report.job_id}`);
+      if (alive.current && revision === displayRevision.current) {
+        setData(loaded); setSection("summary"); setHistoryOpen(false);
+        if (loaded.code) setStock(loaded.code);
+        setMsg(`已加载历史报告：${loaded.name || loaded.code}（${loaded.code}）· ${loaded.generated_at || report.generated_at}`);
+      }
+    } catch (error) {
+      if (alive.current) setMsg(error instanceof Error ? error.message : "历史报告读取失败");
+    } finally {
+      if (alive.current) setLoadingReportId("");
+    }
+  }
+
+  async function deleteHistoricalReport(report: DeepDiveReportSummary) {
+    if (!window.confirm(`确认删除这份辩论报告？\n${report.name || report.code}（${report.code}）· ${report.generated_at || "时间未知"}\n\n删除后无法恢复。`)) return;
+    const revision = ++displayRevision.current;
+    setDeletingReportId(report.job_id); setMsg("");
+    try {
+      const result = await agentRequest<DeepDiveDeleteResult>(`/deepdive/reports/${report.job_id}/delete`, {});
+      if (!alive.current || revision !== displayRevision.current) return;
+      setHistory({ total: result.total, reports: result.reports });
+      if (data?.job_id === report.job_id) {
+        setData(null);
+        if (result.latest_job_id) {
+          const replacement = await agentRequest<DeepDiveData>(`/deepdive/reports/${result.latest_job_id}`);
+          if (alive.current && revision === displayRevision.current) {
+            setData(replacement); setSection("summary");
+            if (replacement.code) setStock(replacement.code);
+          }
+        }
+      }
+      if (alive.current && revision === displayRevision.current) {
+        setMsg(`已删除报告：${report.name || report.code}（${report.code}）· ${report.generated_at || "时间未知"}`);
+      }
+    } catch (error) {
+      if (alive.current) setMsg(error instanceof Error ? error.message : "历史报告删除失败");
+    } finally {
+      if (alive.current) setDeletingReportId("");
+    }
   }
 
   async function pollOnce() {
@@ -150,7 +239,35 @@ export function DeepDive() {
       </div>
 
       <p className="text-xs text-muted-foreground">本次任务使用已保存的 AI 来源获取公开资料并执行四维分析与辩论，不改变首页 Agent 开关。{stage && `当前阶段：${stage}`}</p>
-      {!running && <button onClick={() => { target.current = ""; sessionStorage.removeItem(acceptedKey); void loadLatest(); void pollOnce(); }} className="rounded-lg border border-border px-3 py-2 text-sm">查看最近完成报告</button>}
+      {!running && <div className="flex flex-wrap items-center gap-2">
+        <button aria-label="历史辩论报告" disabled={historyLoading} onClick={() => void toggleHistory()} className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm disabled:opacity-50">
+          {historyLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <History className="h-4 w-4" />}
+          {historyLoading ? "正在读取历史…" : `历史辩论报告${history.total ? `（${history.total}）` : ""}`}
+          {historyOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+        </button>
+        <button aria-label="查看最近完成报告" disabled={loadingLatest} onClick={() => void showLatest()} className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm disabled:opacity-50">{loadingLatest && <Loader2 className="h-4 w-4 animate-spin" />}{loadingLatest ? "正在读取最近报告…" : "重新加载最近一份"}</button>
+      </div>}
+      {historyOpen && !running && <section className="glass overflow-hidden rounded-2xl border border-border">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+          <div><b className="text-sm">历史辩论报告</b><p className="mt-0.5 text-xs text-muted-foreground">每次成功运行独立保存；同一标的的不同版本不会互相覆盖。</p></div>
+          <span className="text-xs text-muted-foreground">共 {history.total} 份</span>
+        </div>
+        {historyLoading ? <div className="flex items-center gap-2 px-4 py-6 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在读取历史报告…</div>
+          : history.reports.length === 0 ? <p className="px-4 py-6 text-sm text-muted-foreground">尚无已完成的历史报告</p>
+          : <div className="max-h-80 divide-y divide-border/60 overflow-y-auto">{history.reports.map((report) => (
+            <div key={report.job_id} className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-4 px-4 transition-colors hover:bg-muted/50">
+              <button onClick={() => void loadHistoricalReport(report)} disabled={Boolean(loadingReportId || deletingReportId)} className="py-3 text-left disabled:opacity-60">
+                <b className="block text-sm">{report.name || report.code} <span className="font-mono text-xs font-normal text-muted-foreground">（{report.code}）</span></b><small className="mt-1 block text-muted-foreground">生成于 {report.generated_at || "时间未知"}{report.trade_date ? ` · 行情日 ${report.trade_date}` : ""}</small>
+              </button>
+              <span className="flex items-center gap-3 text-xs text-muted-foreground">
+                {report.ai_source?.model || report.ai_source?.provider || "AI"}{loadingReportId === report.job_id && <Loader2 className="h-4 w-4 animate-spin" />}
+                <button aria-label={`删除 ${report.name || report.code} 的报告`} title="删除这份报告" disabled={Boolean(loadingReportId || deletingReportId)} onClick={() => void deleteHistoricalReport(report)} className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-danger/10 hover:text-danger disabled:opacity-50">
+                  {deletingReportId === report.job_id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                </button>
+              </span>
+            </div>
+          ))}</div>}
+      </section>}
       {running && <button onClick={cancel} className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm"><Square size={14} />取消本次深挖</button>}
       {recovery && !running && <button onClick={() => deepdive(true)} className="rounded-lg border border-border px-3 py-2 text-sm">恢复本次请求 / 查询状态</button>}
       {msg && <div className="glass rounded-xl px-4 py-3 text-sm text-muted-foreground">{msg}</div>}

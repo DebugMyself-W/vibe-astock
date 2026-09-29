@@ -149,6 +149,7 @@ export interface SectorFlow {
 }
 export interface MarketOverview {
   sentiment: MarketSentiment; sectors: SectorFlow[]; updated: string;
+  warnings?: string[];
 }
 
 // 短线情绪：连板梯队 / 最高连板 / 炸板率 / 封板率 / 晋级率 / 涨跌停家数 + 连板股清单（客观公开榜单）
@@ -158,6 +159,10 @@ export interface LianbanStock {
   price: number; pct: number; amount: number | null; float_cap: number | null; industry: string;
   reason: string;  // 涨停原因题材串（问财；缺 key/失败为空串）
   close_status?: string;
+  last_seal_time?: string;
+  break_count?: number | null;
+  seal_fund?: number | null;
+  is_sealed?: boolean;
   traffic_light?: StockTrafficLight;
 }
 
@@ -174,8 +179,9 @@ export interface IndustryPeer {
 }
 export interface IndustryPeers {
   available: boolean; reason?: string;
-  board?: { code: string; name: string; basis: "industry" | "concept" };
-  quote_date?: string | null; focus_code?: string; total?: number;
+  board?: { code: string; name: string; basis: "industry" | "concept" | "review_limit_up_sample" | "csrc_industry" };
+  quote_date?: string | null; requested_date?: string | null; classification_date?: string | null; focus_code?: string; total?: number;
+  degraded?: boolean; preview?: boolean; note?: string;
   members: IndustryPeer[]; source?: string;
 }
 export interface IntradayPoint { time: string; date?: string; label?: string; price: number; volume: number; pct?: number; }
@@ -188,13 +194,18 @@ export interface IntradayBundle {
   series: Record<string, IntradayLine>;
 }
 export interface ShortTermEmotion {
+  available?: boolean;
   date: string;
-  zt_count: number; dt_count: number; zb_count: number;
+  source_date?: string;
+  updated?: string;
+  data_status?: "current" | "partial" | "stale" | string;
+  data_note?: string;
+  zt_count: number; dt_count: number | null; zb_count: number | null;
   max_boards: number; lianban_count: number;
   ladder: EmotionTier[];
   lianban_stocks: LianbanStock[];
   seal_rate: number | null; break_rate: number | null; promotion_rate: number | null;
-  yzt_count: number;
+  yzt_count: number | null;
 }
 
 // 每日盯盘：3 秒实时快照（持仓/自选/500亿大票/三板+/昨日成交前十 + 异动流）
@@ -404,18 +415,34 @@ export interface LimitBreakAlerts {
 
 export interface IwencaiStatus {
   configured: boolean; source_priority: string[]; intraday_refresh_minutes: 0 | 30 | 60 | 120;
+  source?: "settings" | "environment";
   day: string; requests_today: number; successes_today: number; failures_today: number;
   last_attempt_at: string | null; circuit_state: string; blocked_until: string | null;
   circuit_reason: string | null;
 }
 export interface AppSettings {
   iwencai_intraday_refresh_minutes: 0 | 30 | 60 | 120;
+  market_network: { mode: "auto" | "direct" | "proxy"; proxy_url: string };
+  market_network_status: {
+    configured_mode: "auto" | "direct" | "proxy"; effective_mode: "auto" | "direct" | "proxy";
+    override_source: string | null; proxy_available: boolean; proxy_source: string | null;
+    proxy_label: string; last_route: "direct" | "proxy" | null; last_route_at: string | null; ai_isolated: boolean;
+  };
   review_schedule: {
     enabled: boolean; time: string; force: boolean; last_date: string | null;
+    source: { provider: "codex-private" | "claude" | "codebuddy"; model: string } | null;
     last_triggered_at: string | null; last_status: "running" | "succeeded" | "failed" | null;
     last_finished_at: string | null; last_error: string | null; last_elapsed: number | null;
   };
   iwencai: IwencaiStatus;
+}
+export interface MarketNetworkDiagnostic {
+  generated_at: string;
+  status: AppSettings["market_network_status"];
+  routes: Array<{ route: "direct" | "proxy"; ok: boolean; skipped?: boolean; detail?: string; sources: Array<{
+    source: string; label: string; ok: boolean; latency_ms: number; detail: string;
+  }> }>;
+  tcp_note: string;
 }
 
 export type ValidationState = "pending" | "watching" | "satisfied" | "invalidated" | "insufficient_data" | "expired";
@@ -459,8 +486,12 @@ export interface TodayValidationData {
 export const api = {
   health: () => get<{ ok: boolean }>("/health"),
   settings: () => get<AppSettings>("/settings"),
-  saveSettings: (settings: { iwencai_intraday_refresh_minutes: 0 | 30 | 60 | 120; review_schedule?: AppSettings["review_schedule"] }) =>
+  saveSettings: (settings: { iwencai_intraday_refresh_minutes: 0 | 30 | 60 | 120; review_schedule?: AppSettings["review_schedule"]; market_network?: AppSettings["market_network"] }) =>
     request<AppSettings>("/settings", "PUT", settings),
+  diagnoseMarketNetwork: () => request<MarketNetworkDiagnostic>("/settings/market-network/diagnose", "POST"),
+  saveIwencaiKey: (api_key: string) => request<AppSettings>("/settings/iwencai-key", "PUT", { api_key }),
+  clearIwencaiKey: () => request<AppSettings>("/settings/iwencai-key", "DELETE"),
+  retryScheduledReview: () => request<{ running: boolean; date: string; job_id?: string; error?: string }>("/review/retry-scheduled", "POST"),
   indices: () => get<IndexQuote[]>("/indices"),
   marketSession: () => get<MarketSession>("/market/session"),
   todayValidation: (date?: string, at?: string) => {
@@ -473,7 +504,7 @@ export const api = {
   overseas: () => get<OverseasSnapshot>("/market/overseas"),
   liveEmotion: () => get<LiveEmotion>("/market/live-emotion"),
   marketOverview: () => get<MarketOverview>("/market/overview"),
-  emotion: () => get<ShortTermEmotion>("/market/emotion"),
+  emotion: (refresh = false) => get<ShortTermEmotion>(`/market/emotion${refresh ? "?refresh=true" : ""}`),
   boardTrafficLight: (codes: string[], stockMode: "live" | "settled" = "live", date?: string) => {
     const params = new URLSearchParams();
     if (codes.length) params.set("codes", codes.join(","));
@@ -499,7 +530,7 @@ export const api = {
     const snapshot = await get<MonitorSnapshot>(`/monitor/snapshot?watch=${encodeURIComponent(monitored)}`);
     return {...snapshot, watch_warning: monitorWarning || (codes.length > 100 ? '已有自选超过100只，本页仅监控前100只；原列表保留，可在持仓自选中整理' : undefined)};
   },
-  firstBoard: () => get<FirstBoardData>("/market/first-board"),
+  firstBoard: (date?: string) => get<FirstBoardData>(`/market/first-board${date ? `?date=${encodeURIComponent(date)}` : ""}`),
   turnoverTop: () => get<TurnoverTop>("/market/turnover-top"),
   globalIndices: () => get<GlobalIndex[]>("/global/indices"),
   globalStock: (symbol: string) => get<GlobalStock>(`/global/stock?symbol=${encodeURIComponent(symbol)}`),
@@ -520,8 +551,8 @@ export const api = {
   kline: (code: string, category = 4, offset = 120) => get<KlineRow[]>(
     `/kline?code=${encodeURIComponent(code)}&category=${category}&offset=${offset}`,
   ),
-  industryPeers: (industry: string, code: string, limit = 300) => get<IndustryPeers>(
-    `/market/industry-peers?industry=${encodeURIComponent(industry)}&code=${encodeURIComponent(code)}&limit=${limit}`,
+  industryPeers: (industry: string, code: string, limit = 300, date?: string | null) => get<IndustryPeers>(
+    `/market/industry-peers?industry=${encodeURIComponent(industry)}&code=${encodeURIComponent(code)}&limit=${limit}${date ? `&date=${encodeURIComponent(date)}` : ""}`,
   ),
   conceptPeers: (concept: string, code = "", limit = 30) => get<IndustryPeers>(
     `/market/concept-peers?concept=${encodeURIComponent(concept)}&code=${encodeURIComponent(code)}&limit=${limit}`,

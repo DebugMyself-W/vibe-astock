@@ -17,8 +17,9 @@ import re
 import json
 import time
 import datetime
-import requests
 import pandas as pd
+
+from net_utils import market_session
 
 # 先把仓库根的 .env 读进来 —— 下面的代理开关要用它。
 # 🔴 顺序要紧：README 让用户把配置写在 .env 里，如果开关在 _load_env() 之前就算完，
@@ -35,22 +36,30 @@ def _load_env():
     环境变量里已有的不覆盖；文件不存在就什么也不做。
     """
     env_path = os.path.join(_REPO_ROOT, ".env")
-    if not os.path.exists(env_path):
-        return
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("export "):
+                        line = line[len("export "):]
+                    if "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip('"').strip("'")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+        except Exception:
+            pass
+    # The settings-page override is intentionally applied last.  In
+    # particular, a saved disabled state must be able to suppress an old key
+    # still present in .env without editing the repository.
     try:
-        with open(env_path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("export "):
-                    line = line[len("export "):]
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k, v = k.strip(), v.strip().strip('"').strip("'")
-                if k and k not in os.environ:
-                    os.environ[k] = v
+        from .data_credentials import apply_iwencai_override
+
+        apply_iwencai_override()
     except Exception:
         pass
 
@@ -60,62 +69,9 @@ _load_env()
 
 
 
-# ---- 代理：本模块自己直连，但**不替整个进程做决定** -------------------------
-# 东财 / 腾讯是国内站，开着科学上网时系统代理常把它们的路由挂掉，所以本模块自己发的
-# 请求默认直连（`trust_env=False`，见 `_direct_get`）。这一层只影响本模块，安全。
-#
-# ⛔ 这个模块在 server 启动时就被 import，所以**任何进程级的环境改动都会波及别人**：
-#   · 早先这里在模块顶层 pop 掉了 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY ——
-#     等于顺手废掉整个进程的代理，而同一进程里 LLM 调用可能正靠它出网，
-#     表现只是"模型调不通"，没人会联想到取数模块；
-#   · 改成"把 eastmoney.com 加进 NO_PROXY"也不行：`vr/astock.py` 的东财客户端
-#     本来就是**直连优先、失败自动回退系统代理**，而它的代理会话是 `trust_env=True`
-#     （靠环境变量拿代理）。往 NO_PROXY 里塞 eastmoney.com 会把那条自愈回退
-#     静默废成"再直连一次"。而且 akshare 用的四个东财域名 vr 全都在用，
-#     没法只绕自己那份。
-#
-# 所以默认**什么都不改**。代价：akshare 内部自己 new requests（塞不进本模块的会话），
-# 在"系统代理挂掉东财"的机器上它会失败 —— 但那是响亮的失败：核心数据缺 → 体检拒跑 →
-# 界面给一句能照着办的话，而不是静默给错数。要连 akshare 一起强行直连就显式开
-# VIBE_MARKET_DIRECT=1（下面会说清它是进程级的）。
-_DIRECT_HOSTS = ("eastmoney.com", "qt.gtimg.cn")
-
-
-def _flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
-
-
-# 行情要走代理（东财在这台机器上只能经代理访问）。VR_DATA_PROXY 是 vr/ 那边同义的
-# 开关，一并认，别让两处互相拆台。
-_USE_PROXY_FOR_MARKET = _flag("VIBE_MARKET_PROXY") or _flag("VR_DATA_PROXY")
-# 反向：连 akshare 也强行直连。**这条是进程级的**，会一并关掉 vr 对东财的代理回退，
-# 所以必须由用户显式打开，不能当默认。
-_FORCE_DIRECT = _flag("VIBE_MARKET_DIRECT") and not _USE_PROXY_FOR_MARKET
-
-if _FORCE_DIRECT:
-    # 🔴 大小写两个变量都要写。requests 取 no_proxy 时**小写优先**
-    # （`os.environ.get(k) or os.environ.get(k.upper())`），只更新 NO_PROXY 的话，
-    # 凡是环境里已经有小写 no_proxy 的机器上这一整段就白做 —— 照样走代理、照样 403，
-    # 而且现象和"没改过"一模一样，看不出来。
-    _existing = [h.strip()
-                 for v in (os.environ.get("no_proxy", ""), os.environ.get("NO_PROXY", ""))
-                 for h in v.split(",") if h.strip()]
-    _merged = ",".join(dict.fromkeys([*_existing, *_DIRECT_HOSTS]))
-    os.environ["NO_PROXY"] = _merged
-    os.environ["no_proxy"] = _merged
-
-_TRUST_ENV = _USE_PROXY_FOR_MARKET
-
-
 def _direct_get(url, **kw):
-    """本模块自己发的 GET。
-
-    每次新建会话而不是共用一个：`Session` 的 cookie jar 是可变共享状态，而这个服务
-    是并发的（复盘在后台线程跑，页面同时在拉行情）。这两处都是一次性 GET，
-    省下的连接复用不值得拿并发正确性去换。
-    """
-    with requests.Session() as s:
-        s.trust_env = _TRUST_ENV
+    """兼容旧测试/调用名；实际路由由统一市场数据网络策略决定。"""
+    with market_session() as s:
         return s.get(url, **kw)
 
 # ----------------------------------------------------------------------------
@@ -140,6 +96,17 @@ def _iwencai_client_cls():
 
 
 DELAY_HOST = "https://push2delay.eastmoney.com/api/qt/clist/get"
+CLIST_HOSTS = (
+    DELAY_HOST,
+    "https://push2.eastmoney.com/api/qt/clist/get",
+    # 与主站同字段、同排序的东财官方备用节点；部分 Clash 规则只会重置
+    # push2/push2delay，而该节点仍可返回完整目录和成分。
+    "https://push2test.eastmoney.com/api/qt/clist/get",
+    # Windows Clash 在部分规则下会把东财 HTTPS 的 CONNECT 直接断开；同一官方
+    # clist 接口的 HTTP 地址仍能稳定返回公开行情。这里仅作最后兜底，不承载密钥、
+    # Cookie 或任何用户数据，字段与排序参数完全不变。
+    "http://push2.eastmoney.com/api/qt/clist/get",
+)
 UT_FUND = "b2884a393a59ad64002292a3e90d46a5"  # 资金流 ut
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                          "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -154,6 +121,39 @@ ALL_A_FS = ("m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:7,m:1+t:3,"
 # ----------------------------------------------------------------------------
 # 通用 push2delay clist 拉取 (自动翻页)
 # ----------------------------------------------------------------------------
+def _clist_request(params, retries=3, preferred_host=None):
+    """请求一页 clist，并在同一东财接口的官方入口间降级。"""
+    last_error = None
+    for attempt in range(retries):
+        hosts = ((preferred_host,) + tuple(host for host in CLIST_HOSTS if host != preferred_host)
+                 if preferred_host else CLIST_HOSTS)
+        for host in hosts:
+            try:
+                r = _direct_get(host, params=params, headers=HEADERS, timeout=15)
+                data = r.json().get("data")
+                if data is not None:
+                    return data, host
+            except Exception as exc:  # noqa: BLE001 - 依次尝试同源官方入口
+                last_error = exc
+        if attempt < retries - 1:
+            time.sleep(1.5)
+    if last_error is not None:
+        raise last_error
+    return None, preferred_host
+
+
+def _clist_page(fs, fid, fields, ut=UT_FUND, pz=100, retries=3):
+    """只取排序后的首屏，同时保留接口声明的完整成分总数。"""
+    params = {
+        "pn": 1, "pz": pz, "po": 1, "np": 1, "ut": ut,
+        "fltt": 2, "invt": 2, "fid": fid, "fs": fs,
+        "fields": fields, "_": int(time.time() * 1000),
+    }
+    data, _host = _clist_request(params, retries=retries)
+    rows = (data or {}).get("diff") or []
+    return rows, int((data or {}).get("total") or len(rows))
+
+
 def _clist(fs, fid, fields, ut=UT_FUND, pz=100, max_pages=80, retries=3):
     """
     通用 clist 抓取, 返回 list[dict].
@@ -163,23 +163,16 @@ def _clist(fs, fid, fields, ut=UT_FUND, pz=100, max_pages=80, retries=3):
     rows = []
     page = 1
     total = None
+    preferred_host = None
     while page <= max_pages:
         params = {
             "pn": page, "pz": pz, "po": 1, "np": 1, "ut": ut,
             "fltt": 2, "invt": 2, "fid": fid, "fs": fs,
             "fields": fields, "_": int(time.time() * 1000),
         }
-        data = None
-        for attempt in range(retries):
-            try:
-                r = _direct_get(DELAY_HOST, params=params,
-                                 headers=HEADERS, timeout=15)
-                data = r.json().get("data")
-                break
-            except Exception:
-                if attempt == retries - 1:
-                    raise
-                time.sleep(1.5)
+        data, preferred_host = _clist_request(
+            params, retries=retries, preferred_host=preferred_host,
+        )
         if not data or not data.get("diff"):
             break
         diff = data["diff"]
@@ -497,6 +490,68 @@ def fetch_indices():
             "group": group,
         })
     return out
+
+
+def fetch_a_index_day(date: str) -> dict:
+    """Return the four A-share index closes for one historical session.
+
+    Tencent's daily-kline response includes the previous close, so the change
+    belongs to ``date`` rather than to whichever live session happens to be
+    available when an old review is regenerated.  An incomplete response keeps
+    this dimension unavailable instead of presenting a partial market picture.
+    """
+    try:
+        target = datetime.datetime.strptime(date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return {"available": False, "date": date, "reason": "指数日期无效", "items": []}
+
+    start = (target - datetime.timedelta(days=18)).isoformat()
+    items = []
+    for code, name in A_INDICES:
+        try:
+            response = _direct_get(
+                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                params={"param": f"{code},day,{start},{date},20,qfq"},
+                headers=HEADERS,
+                timeout=10,
+            )
+            response.raise_for_status()
+            node = (response.json().get("data") or {}).get(code) or {}
+            rows = node.get("qfqday") or node.get("day") or []
+            rows = [
+                row
+                for row in rows
+                if isinstance(row, list) and len(row) >= 3 and row[0] <= date
+            ]
+            current_index = next(
+                (i for i in range(len(rows) - 1, -1, -1) if rows[i][0] == date),
+                None,
+            )
+            if current_index is None or current_index < 1:
+                raise ValueError("目标交易日或前收盘缺失")
+            close = float(rows[current_index][2])
+            previous_close = float(rows[current_index - 1][2])
+            if close <= 0 or previous_close <= 0:
+                raise ValueError("指数收盘价无效")
+            items.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "price": close,
+                    "change_pct": round((close / previous_close - 1) * 100, 3),
+                }
+            )
+        except Exception:
+            continue
+
+    complete = len(items) == len(A_INDICES)
+    return {
+        "available": complete,
+        "date": date,
+        "items": items,
+        "source": "tencent_daily_kline",
+        "reason": "" if complete else f"四大指数仅 {len(items)}/4 可用",
+    }
 
 
 # ----------------------------------------------------------------------------

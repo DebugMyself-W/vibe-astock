@@ -15,7 +15,10 @@
 
 from __future__ import annotations
 
-import astock
+try:  # 兼容 `python vr/app.py` 与包方式导入
+    from . import astock
+except ImportError:  # pragma: no cover - 脚本启动路径
+    import astock
 
 _UA_H = {"User-Agent": astock.UA}
 _GS_HOSTS = ("push2.eastmoney.com", "push2delay.eastmoney.com")

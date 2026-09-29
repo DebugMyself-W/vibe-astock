@@ -76,6 +76,102 @@ def test_dd_failure_preserves_previous(tmp_path, monkeypatch, result):
     finally: m.shutdown()
 
 
+def test_deepdive_history_lists_every_immutable_version_newest_first(tmp_path):
+    m = manager(tmp_path)
+    versions = [
+        ("a" * 32, "000993", "闽东电力", "2026-09-26 09:04 CST"),
+        ("b" * 32, "002519", "银河电子", "2026-09-26 21:35 CST"),
+        ("c" * 32, "000993", "闽东电力", "2026-09-27 20:21 CST"),
+    ]
+    try:
+        for job_id, code, name, generated_at in versions:
+            (m.deepdive.history / f"{job_id}.json").write_text(json.dumps({
+                "job_id": job_id,
+                "code": code,
+                "name": name,
+                "generated_at": generated_at,
+                "trade_date": generated_at[:10],
+                "ai_source": {"provider": "codex-private", "model": "gpt-test"},
+                "verdict": {"one_liner": "ok"},
+            }), encoding="utf-8")
+        (m.deepdive.history / ("d" * 32 + ".json")).write_text("{broken", encoding="utf-8")
+
+        all_reports = m.deepdive.list_reports(limit=20)
+        code_reports = m.deepdive.list_reports(limit=20, code="000993")
+
+        assert all_reports["total"] == 3
+        assert [row["job_id"] for row in all_reports["reports"]] == ["c" * 32, "b" * 32, "a" * 32]
+        assert code_reports["total"] == 2
+        assert [row["job_id"] for row in code_reports["reports"]] == ["c" * 32, "a" * 32]
+        assert all_reports["reports"][0]["ai_source"]["model"] == "gpt-test"
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from review_agent.api import create_router
+        app = FastAPI()
+        app.include_router(create_router(m, "history-test"))
+        response = TestClient(app, base_url="http://127.0.0.1").get(
+            "/api/review-agent/deepdive/reports?code=000993",
+            headers={"Authorization": "Bearer history-test"},
+        )
+        assert response.status_code == 200
+        assert response.json()["total"] == 2
+    finally:
+        m.shutdown()
+
+
+def test_deepdive_delete_report_rebuilds_latest_indexes(tmp_path):
+    m = manager(tmp_path)
+    versions = [
+        ("a" * 32, "000993", "闽东电力", "2026-09-26 09:04 CST"),
+        ("b" * 32, "002519", "银河电子", "2026-09-26 21:35 CST"),
+        ("c" * 32, "000993", "闽东电力", "2026-09-27 20:21 CST"),
+    ]
+    try:
+        payloads = []
+        for job_id, code, name, generated_at in versions:
+            payload = {
+                "job_id": job_id,
+                "code": code,
+                "name": name,
+                "generated_at": generated_at,
+                "trade_date": generated_at[:10],
+                "ai_source": {"provider": "codex-private", "model": "gpt-test"},
+                "verdict": {"one_liner": "ok"},
+            }
+            payloads.append(payload)
+            (m.deepdive.history / f"{job_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+        (m.deepdive.reports / "latest.json").write_text(json.dumps(payloads[2]), encoding="utf-8")
+        (m.deepdive.reports / "000993.json").write_text(json.dumps(payloads[2]), encoding="utf-8")
+        (m.deepdive.reports / "002519.json").write_text(json.dumps(payloads[1]), encoding="utf-8")
+
+        result = m.deepdive.delete_report("c" * 32)
+
+        assert result["deleted_job_id"] == "c" * 32
+        assert result["total"] == 2
+        assert result["latest_job_id"] == "b" * 32
+        assert not (m.deepdive.history / ("c" * 32 + ".json")).exists()
+        assert json.loads((m.deepdive.reports / "latest.json").read_text())["job_id"] == "b" * 32
+        assert json.loads((m.deepdive.reports / "000993.json").read_text())["job_id"] == "a" * 32
+        assert json.loads((m.deepdive.reports / "002519.json").read_text())["job_id"] == "b" * 32
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from review_agent.api import create_router
+        app = FastAPI()
+        app.include_router(create_router(m, "delete-test"))
+        response = TestClient(app, base_url="http://127.0.0.1").post(
+            f"/api/review-agent/deepdive/reports/{'a' * 32}/delete",
+            headers={"Authorization": "Bearer delete-test", "Content-Type": "application/json"},
+            json={},
+        )
+        assert response.status_code == 200
+        assert response.json()["total"] == 1
+        assert not (m.deepdive.reports / "000993.json").exists()
+    finally:
+        m.shutdown()
+
+
 def test_cancel_prevents_publish_and_source_switch_during_active(tmp_path, monkeypatch):
     from review_agent.evidence import EvidenceError
     m = manager(tmp_path)

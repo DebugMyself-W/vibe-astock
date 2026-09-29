@@ -317,13 +317,15 @@ def monitor_watch(body: MonitorWatchInput):
 
 
 @app.get("/api/market/first-board")
-def market_first_board():
+def market_first_board(date: str | None = Query(None)):
     """首板分析：今日首板涨停股（连板数=1）+ 涨停原因题材串（问财，缺 key 优雅降级）。
 
     客观公开榜单数据（东财涨停池同款），只呈现事实，不附推荐/评分/预测/买卖时机。缓存 10 分钟。
     """
     try:
-        return {"data": firstboard.get_first_board()}
+        return {"data": firstboard.get_first_board(date)}
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"首板数据异常：{e}") from e
 

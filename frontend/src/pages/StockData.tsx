@@ -4,12 +4,13 @@ import { useEffect, useRef, useState } from "react";
 import { pctColor } from "@/lib/colors";
 import {
   Search, FileText, Newspaper, Loader2, AlertCircle, LineChart, BarChart3, Megaphone,
-  Wallet, Trophy, CalendarClock, Boxes, MessageSquare,
+  Wallet, Trophy, CalendarClock, MessageSquare,
 } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { AskAiButton } from "@/components/ui/AskAiButton";
 import { EarningsSnapshot } from "@/components/ui/EarningsSnapshot";
+import { StockConceptCard } from "@/components/StockConceptCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import {
   api, ApiError, type Valuation, type Report, type NewsItem, type ValPercentile, type ValMetric,
@@ -537,26 +538,7 @@ export function StockData() {
 
           {/* 板块归属 · 概念 */}
           {((blocks && blocks.concept_tags.length > 0) || hotCon.length > 0) && (
-            <GlassCard className="mb-4">
-              <h3 className="mb-3 flex items-center gap-1.5 text-sm font-semibold"><Boxes className="h-4 w-4 text-primary" /> 板块归属 · 概念</h3>
-              {blocks && blocks.concept_tags.length > 0 && (
-                <div className="mb-3 flex flex-wrap gap-1.5">
-                  {blocks.concept_tags.slice(0, 24).map((t, i) => (
-                    <span key={i} className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">{t}</span>
-                  ))}
-                </div>
-              )}
-              {hotCon.length > 0 && (
-                <div>
-                  <p className="mb-1.5 text-xs text-muted-foreground">当下热门概念命中</p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {hotCon.slice(0, 12).map((h, i) => (
-                      <span key={i} className="rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">{h.concept}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </GlassCard>
+            <StockConceptCard blocks={blocks} hotConcepts={hotCon} />
           )}
 
           {/* 投资者互动（互动易） */}

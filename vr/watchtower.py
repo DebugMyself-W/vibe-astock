@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import astock
+from net_utils import market_urlopen
 from vr import previous_ladder
 
 BEIJING = timezone(timedelta(hours=8))
@@ -70,7 +71,7 @@ def _tencent_batch(codes: list[str]) -> dict[str, dict]:
         q = ",".join(_prefix(c) + c for c in batch)
         try:
             req = urllib.request.Request(f"https://qt.gtimg.cn/q={q}", headers={"User-Agent": UA})
-            raw = urllib.request.urlopen(req, timeout=5).read().decode("gbk", "ignore")
+            raw = market_urlopen(req, timeout=5).read().decode("gbk", "ignore")
         except Exception:  # noqa: BLE001
             continue
         for line in raw.split(";"):

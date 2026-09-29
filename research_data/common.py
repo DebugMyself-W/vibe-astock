@@ -23,6 +23,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
+from net_utils import market_session
+
 if os.name == "nt":
     import msvcrt
 else:
@@ -90,20 +92,14 @@ def bs_code(digits: str, market: str) -> str:
 
 
 # ---------------- 东财限流(跨进程) ----------------
-_em_sessions: dict = {}
 EM_PUSH2_HOSTS = ("push2delay.eastmoney.com", "push2.eastmoney.com")
 EM_PUSH2HIS_HOSTS = ("push2his.eastmoney.com", "push2delay.eastmoney.com")
 
 
-def _em_session(trust_env: bool):
-    import requests  # 延迟导入,纯 urllib 脚本不依赖 requests
-
-    if trust_env not in _em_sessions:
-        s = requests.Session()
-        s.trust_env = trust_env
-        s.headers.update({"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"})
-        _em_sessions[trust_env] = s
-    return _em_sessions[trust_env]
+def _em_request(url: str, params: Optional[dict], headers: Optional[dict], timeout: int):
+    with market_session() as session:
+        session.headers.update({"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"})
+        return session.get(url, params=params, headers=headers, timeout=timeout)
 
 
 def _lock_em_file(lf) -> None:
@@ -166,14 +162,8 @@ def _em_serial(fn):
 
 
 def em_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 15):
-    """东财统一入口:跨进程串行(锁覆盖整个请求)+ 会话复用 + UA/Referer;403 不重试。
-    先按系统代理设置请求,遇连接类错误再直连重试一次(东财单域经代理常断连);每次重试同样排队。"""
-    import requests
-
-    try:
-        return _em_serial(lambda: _em_session(True).get(url, params=params, headers=headers, timeout=timeout))
-    except (requests.exceptions.ProxyError, requests.exceptions.ConnectionError):
-        return _em_serial(lambda: _em_session(False).get(url, params=params, headers=headers, timeout=timeout))
+    """东财统一入口:跨进程串行 + 统一市场网络路由 + UA/Referer。"""
+    return _em_serial(lambda: _em_request(url, params, headers, timeout))
 
 
 def em_multi_host(hosts: tuple, path: str, params: Optional[dict] = None, timeout: int = 15):

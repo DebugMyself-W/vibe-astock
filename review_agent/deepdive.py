@@ -146,3 +146,98 @@ class DeepDive(Daily):
             return json.loads((self.history / (job_id + ".json")).read_text())
         except (OSError, ValueError):
             raise EvidenceError("本次深挖没有已保存报告") from None
+
+    def list_reports(self, limit=50, code=""):
+        """List immutable deep-dive versions without loading their full report bodies."""
+        import re
+
+        limit = max(1, min(int(limit), 200))
+        code = str(code or "").strip()
+        if code and not re.fullmatch(r"\d{6}", code):
+            raise EvidenceError("股票代码必须是 6 位数字")
+        reports = []
+        for path in self.history.glob("*.json"):
+            job_id = path.stem
+            if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if (not isinstance(payload, dict) or payload.get("job_id") != job_id
+                        or not isinstance(payload.get("verdict"), dict)):
+                    continue
+                report_code = str(payload.get("code") or "")
+                if code and report_code != code:
+                    continue
+                reports.append({
+                    "job_id": job_id,
+                    "code": report_code,
+                    "name": str(payload.get("name") or report_code),
+                    "generated_at": str(payload.get("generated_at") or ""),
+                    "trade_date": str(payload.get("trade_date") or ""),
+                    "ai_source": payload.get("ai_source") or {},
+                    "_mtime": path.stat().st_mtime_ns,
+                })
+            except (OSError, ValueError, AttributeError):
+                continue
+        reports.sort(key=lambda row: (row["generated_at"], row["_mtime"]), reverse=True)
+        total = len(reports)
+        for row in reports:
+            row.pop("_mtime", None)
+        return {"total": total, "reports": reports[:limit]}
+
+    def delete_report(self, job_id):
+        """Delete one immutable report and repair latest/code compatibility indexes."""
+        import re
+
+        if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+            raise EvidenceError("任务标识无效")
+        version_path = self.history / (job_id + ".json")
+        with self.state_lock:
+            try:
+                payload = json.loads(version_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raise EvidenceError("未找到要删除的深挖报告") from None
+            if not isinstance(payload, dict) or payload.get("job_id") != job_id:
+                raise EvidenceError("深挖报告记录损坏，未执行删除")
+            code = str(payload.get("code") or "")
+
+            remaining = []
+            for path in self.history.glob("*.json"):
+                if path == version_path:
+                    continue
+                try:
+                    row = json.loads(path.read_text(encoding="utf-8"))
+                    if (isinstance(row, dict) and row.get("job_id") == path.stem
+                            and isinstance(row.get("verdict"), dict)):
+                        remaining.append((str(row.get("generated_at") or ""), path.stat().st_mtime_ns, row))
+                except (OSError, ValueError, AttributeError):
+                    continue
+            remaining.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+            def points_to(path):
+                try:
+                    return json.loads(path.read_text(encoding="utf-8")).get("job_id") == job_id
+                except (OSError, ValueError, AttributeError):
+                    return False
+
+            version_path.unlink()
+            latest_path = self.reports / "latest.json"
+            if points_to(latest_path):
+                if remaining:
+                    atomic_write(latest_path, remaining[0][2])
+                else:
+                    latest_path.unlink(missing_ok=True)
+            code_path = self.reports / (code + ".json")
+            if code and points_to(code_path):
+                replacements = [item for item in remaining if str(item[2].get("code") or "") == code]
+                if replacements:
+                    atomic_write(code_path, replacements[0][2])
+                else:
+                    code_path.unlink(missing_ok=True)
+
+        result = self.list_reports(limit=200)
+        result.update(
+            deleted_job_id=job_id,
+            latest_job_id=result["reports"][0]["job_id"] if result["reports"] else "",
+        )
+        return result

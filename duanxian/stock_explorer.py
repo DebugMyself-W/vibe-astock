@@ -1,7 +1,8 @@
 """连板梯队的标的、同行业成员与分钟行情。
 
-复盘页的梯队必须锚定用户选中的历史交易日；同行业成员和行情则来自公开行情接口，
-所以每份响应都显式携带 ``quote_date`` / ``requested_date``，前端不把两种日期混在一起。
+复盘页的梯队必须锚定用户选中的历史交易日；同行业成员优先来自公开行情接口，
+主源失败时仅降级到该日冻结涨停样本。每份响应都显式携带
+``quote_date`` / ``requested_date``，前端不把两种日期混在一起。
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from . import fetchers, market_facts, trade_calendar
 
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict[str, tuple[float, object]] = {}
+_BAOSTOCK_LOCK = threading.Lock()
 
 
 def _cached(key: str, ttl: int, loader):
@@ -126,34 +128,260 @@ def _name_match(candidate: str, wanted: str) -> tuple[int, int]:
     return (0, 0)
 
 
-def industry_peers(industry: str, focus_code: str = "", limit: int = 300, prefer_concept: bool = False) -> dict:
-    """按东财行业板块返回当前全部成分；行业名被上游截短时做保守前缀匹配。"""
+def _exact_review_industry_sample(
+    industry: str,
+    focus_code: str,
+    date: str,
+    limit: int,
+    source_error: Exception | None = None,
+) -> dict:
+    """东财板块源不可用时，返回复盘日冻结涨停池中的同行业样本。
+
+    这不是完整行业成分，响应必须显式标成降级样本，不能让前端误解成全行业。
+    """
+    pools = market_facts.pools(date)
+    if not pools or not isinstance(pools.get("zt"), list):
+        return {
+            "available": False,
+            "requested_date": date,
+            "reason": f"东财同行业成分暂不可用，且 {date} 冻结涨停池不可用",
+            "members": [],
+        }
+
+    raw_by_code = {}
+    for raw in ((pools.get("raw") or {}).get("zt") or []):
+        code = str(raw.get("代码") or "").zfill(6)
+        if re.fullmatch(r"\d{6}", code):
+            raw_by_code[code] = raw
+
+    members = []
+    for row in pools["zt"]:
+        sector = str(row.get("sector") or "").strip()
+        if not _name_match(sector, industry)[0]:
+            continue
+        code = str(row.get("code") or "").zfill(6)
+        if not re.fullmatch(r"\d{6}", code):
+            continue
+        raw = raw_by_code.get(code, {})
+        members.append({
+            "code": code,
+            "name": str(row.get("name") or ""),
+            "price": _number(raw.get("最新价")),
+            "pct": _number(row.get("ret")),
+            "amount": _number(row.get("amount")),
+            "mcap": None,
+            "float_cap": _number(raw.get("流通市值")),
+            "turnover_pct": _number(row.get("turnover")),
+            "industry": sector or industry,
+            "is_focus": code == focus_code,
+        })
+    members.sort(key=lambda item: (-(item.get("pct") if item.get("pct") is not None else -999), item["code"]))
+    if not members:
+        return {
+            "available": False,
+            "requested_date": date,
+            "reason": f"东财同行业成分暂不可用；{date} 冻结涨停池中也没有“{industry}”同行业样本",
+            "members": [],
+        }
+
+    note = f"东财当前同行业成分不可用；仅显示 {date} 复盘日同行业涨停样本，不代表完整行业成分。"
+    if source_error:
+        note += f" 主源错误：{type(source_error).__name__}。"
+    return {
+        "available": True,
+        "degraded": True,
+        "note": note,
+        "board": {"code": "", "name": industry, "basis": "review_limit_up_sample"},
+        "requested_date": date,
+        "quote_date": date,
+        "focus_code": focus_code,
+        "total": len(members),
+        "members": members[:max(1, min(int(limit), 500))],
+        "source": "exact_date_limit_up_industry_sample",
+    }
+
+
+def _normalized_industry_name(value: str) -> str:
+    name = re.sub(r"^[A-Z]\d{1,3}", "", str(value or "").strip(), flags=re.IGNORECASE)
+    for suffix in ("制造业", "服务业", "行业", "业"):
+        if len(name) > len(suffix) + 1 and name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    return name.strip()
+
+
+def _industry_score(candidate: str, wanted: str) -> tuple[int, int]:
+    candidate = _normalized_industry_name(candidate)
+    wanted = _normalized_industry_name(wanted)
+    score = _name_match(candidate, wanted)
+    if score[0]:
+        return score
+    if candidate and wanted and (candidate in wanted or wanted in candidate):
+        return (1, min(len(candidate), len(wanted)))
+    return (0, 0)
+
+
+def _baostock_industry_rows(date: str) -> list[dict]:
+    """Return the official classification snapshot as of ``date``."""
+    try:
+        import baostock as bs
+    except ImportError as exc:
+        raise RuntimeError("Baostock 行业备用源未安装") from exc
+    with _BAOSTOCK_LOCK:
+        login = bs.login()
+        if login.error_code != "0":
+            raise RuntimeError(f"Baostock 登录失败：{login.error_code} {login.error_msg}")
+        try:
+            result = bs.query_stock_industry(date=date)
+            if result.error_code != "0":
+                raise RuntimeError(f"Baostock 行业查询失败：{result.error_code} {result.error_msg}")
+            rows = []
+            while result.next():
+                values = result.get_row_data()
+                rows.append(dict(zip(result.fields, values)))
+            return rows
+        finally:
+            bs.logout()
+
+
+def _member_quotes(codes: list[str], date: str) -> dict[str, dict]:
+    """Enrich members only when the current quote is exactly the requested close."""
+    ok, _ = trade_calendar.live_quotes_are_close_of(date)
+    if not ok:
+        return {}
+    from vr.astock import tencent_quote
+
+    quotes: dict[str, dict] = {}
+    for start in range(0, len(codes), 50):
+        try:
+            quotes.update(tencent_quote(codes[start:start + 50]))
+        except Exception:  # noqa: BLE001 - names/classification remain useful without quotes
+            continue
+    return quotes
+
+
+def _baostock_industry_peers(
+    industry: str,
+    focus_code: str,
+    date: str,
+    limit: int,
+    source_error: Exception | None = None,
+) -> dict:
+    rows = _cached(
+        f"baostock-industry:{date}", 86400,
+        lambda: _baostock_industry_rows(date),
+    )
+    matched = []
+    best = (0, 0)
+    for row in rows:
+        score = _industry_score(str(row.get("industry") or ""), industry)
+        if score > best:
+            best, matched = score, [row]
+        elif score == best and score[0]:
+            matched.append(row)
+    if not best[0] or not matched:
+        raise ValueError(f"Baostock 未找到“{industry}”对应的证监会行业")
+
+    # A fuzzy match may span similarly named classifications. Retain only the
+    # canonical classification selected by the strongest first match.
+    canonical = str(matched[0].get("industry") or "")
+    matched = [row for row in matched if str(row.get("industry") or "") == canonical]
+    codes = [str(row.get("code") or "").split(".")[-1] for row in matched]
+    quotes = _member_quotes(codes, date)
+    members = []
+    for row, code in zip(matched, codes):
+        if not re.fullmatch(r"\d{6}", code):
+            continue
+        quote = quotes.get(code) or {}
+        members.append({
+            "code": code,
+            "name": str(row.get("code_name") or ""),
+            "price": _number(quote.get("price")),
+            "pct": _number(quote.get("change_pct")),
+            "amount": (_number(quote.get("amount_wan")) * 10000 if _number(quote.get("amount_wan")) is not None else None),
+            "mcap": (_number(quote.get("mcap_yi")) * 1e8 if _number(quote.get("mcap_yi")) is not None else None),
+            "float_cap": (_number(quote.get("float_mcap_yi")) * 1e8 if _number(quote.get("float_mcap_yi")) is not None else None),
+            "turnover_pct": _number(quote.get("turnover_pct")),
+            "industry": _normalized_industry_name(canonical) or industry,
+            "is_focus": code == focus_code,
+        })
+    members.sort(key=lambda item: (
+        -(item.get("pct") if item.get("pct") is not None else -999),
+        not item["is_focus"], item["code"],
+    ))
+    dates = sorted({str(row.get("updateDate") or "") for row in matched if row.get("updateDate")})
+    note = f"东财板块源不可用，已切换为 Baostock 的证监会行业分类“{canonical}”；这是完整分类成分，口径可能与东财板块不同。"
+    if source_error:
+        note += f" 主源错误：{type(source_error).__name__}。"
+    return {
+        "available": True,
+        "degraded": False,
+        "note": note,
+        "board": {"code": "", "name": _normalized_industry_name(canonical) or industry, "basis": "csrc_industry"},
+        "requested_date": date,
+        "classification_date": dates[-1] if dates else None,
+        "quote_date": date,
+        "focus_code": focus_code,
+        "total": len(members),
+        "members": members[:max(1, min(int(limit), 500))],
+        "source": "baostock_csrc_industry",
+    }
+
+
+def _historical_industry_fallback(industry: str, focus_code: str, date: str, limit: int,
+                                  source_error: Exception | None = None) -> dict:
+    try:
+        return _baostock_industry_peers(industry, focus_code, date, limit, source_error)
+    except Exception as fallback_error:  # noqa: BLE001 - final honest sample remains available
+        return _exact_review_industry_sample(industry, focus_code, date, limit, fallback_error)
+
+
+def industry_peers(
+    industry: str,
+    focus_code: str = "",
+    limit: int = 300,
+    prefer_concept: bool = False,
+    date: str | None = None,
+) -> dict:
+    """按东财行业板块返回当前全部成分；失败时可降级到精确复盘日样本。"""
     wanted = str(industry or "").strip()
     if not wanted:
         return {"available": False, "reason": "该标的缺少行业归属", "members": []}
 
-    candidates = []
-    catalog_order = ((3, "concept"), (2, "industry")) if prefer_concept else ((2, "industry"), (3, "concept"))
-    for kind, basis in catalog_order:
-        for row in _board_catalog(kind):
-            score = _name_match(str(row.get("f14") or ""), wanted)
-            if score[0]:
-                candidates.append((score, basis, row))
-        if candidates:
-            break
+    try:
+        candidates = []
+        catalog_order = ((3, "concept"), (2, "industry")) if prefer_concept else ((2, "industry"), (3, "concept"))
+        for kind, basis in catalog_order:
+            for row in _board_catalog(kind):
+                score = _name_match(str(row.get("f14") or ""), wanted)
+                if score[0]:
+                    candidates.append((score, basis, row))
+            if candidates:
+                break
+    except Exception as exc:  # noqa: BLE001 - 网络源异常要降级，不能让整个抽屉 502
+        if date and not prefer_concept:
+            return _historical_industry_fallback(wanted, focus_code, date, limit, exc)
+        raise
     if not candidates:
+        if date and not prefer_concept:
+            return _historical_industry_fallback(wanted, focus_code, date, limit)
         return {"available": False, "reason": f"未找到“{wanted}”对应的板块", "members": []}
 
     _, basis, board = max(candidates, key=lambda item: item[0])
     board_code = str(board.get("f12") or "")
 
     def load_members():
-        return fetchers._clist(
+        return fetchers._clist_page(
             f"b:{board_code}", "f3", "f12,f14,f2,f3,f6,f20,f21,f100",
-            pz=100, max_pages=10,
+            pz=max(100, min(int(limit), 100)),
         )
 
-    rows = _cached(f"board-members:{board_code}", 60, load_members)
+    try:
+        rows, member_total = _cached(f"board-members:{board_code}", 60, load_members)
+    except Exception as exc:  # noqa: BLE001 - 同上，历史页可使用精确日期冻结样本
+        if date and not prefer_concept:
+            return _historical_industry_fallback(wanted, focus_code, date, limit, exc)
+        raise
     members = []
     for row in rows or []:
         code = str(row.get("f12") or "")
@@ -176,7 +404,7 @@ def industry_peers(industry: str, focus_code: str = "", limit: int = 300, prefer
         "board": {"code": board_code, "name": str(board.get("f14") or wanted), "basis": basis},
         "quote_date": trade_calendar.quote_trade_day(),
         "focus_code": focus_code,
-        "total": len(members),
+        "total": member_total,
         "members": members[:max(1, min(int(limit), 500))],
         "source": "eastmoney_board_constituents",
     }

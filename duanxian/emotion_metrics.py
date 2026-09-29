@@ -14,6 +14,7 @@ from . import trade_calendar
 from .util import atomic_write_json
 
 from . import fetchers as dr
+from net_utils import market_urlopen
 
 _TENCENT = "http://qt.gtimg.cn/q="
 _BATCH = 50          # 腾讯批量行情单次上限，取保守值
@@ -36,7 +37,7 @@ def batch_pct(codes: list[str], *, opening_date: str | None = None) -> dict[str,
         chunk = uniq[i : i + _BATCH]
         try:
             url = _TENCENT + ",".join(_tx_symbol(c) for c in chunk)
-            raw = urllib.request.urlopen(url, timeout=10).read().decode("gbk", "ignore")
+            raw = market_urlopen(url, timeout=10).read().decode("gbk", "ignore")
         except Exception:  # noqa: BLE001  单批失败不拖累整体
             continue
         for line in raw.split(";"):

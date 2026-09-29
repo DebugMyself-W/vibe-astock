@@ -61,6 +61,9 @@ function fixture(editable) {
           data.notes.push({ id: "1", text: value.text, created_at: snapshot.observed_at }); body = { ok: true };
         }
         if (url.pathname === "/api/review/followup/bindings") body = { ok: true };
+        if (url.pathname === "/api/review-agent/status") body = { installed: true, subscription_ready: true, engine: "test", default_model: "test" };
+        if (url.pathname === "/api/review-agent/conversations") body = [];
+        if (url.pathname === "/api/review-agent/catalog") body = { targets: [] };
         await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
       });
       await page.goto(base + "/agent/review");

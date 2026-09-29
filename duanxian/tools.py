@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import shutil
 import subprocess
 
 _MAX_RESULTS = 10
@@ -12,6 +14,18 @@ _MAX_QUERY = 200
 def _escape_dsl(q: str) -> str:
     """转义会破坏 exa.web_search_exa(query:"...") 表达式的字符（反斜杠、双引号、换行）。"""
     return q.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
+
+
+def _mcporter_executable() -> str:
+    """Find mcporter even when a systemd/WSL service did not inherit NVM PATH."""
+    found = shutil.which("mcporter")
+    if found:
+        return found
+    candidates = sorted(
+        (Path.home() / ".nvm" / "versions" / "node").glob("*/bin/mcporter"),
+        reverse=True,
+    )
+    return str(candidates[0]) if candidates else "mcporter"
 
 
 def agent_reach_search(query: str, num_results: int = 5, timeout: int = 90) -> str:
@@ -24,7 +38,7 @@ def agent_reach_search(query: str, num_results: int = 5, timeout: int = 90) -> s
     cmd = f'exa.web_search_exa(query:"{q}", numResults:{num_results})'
     try:
         out = subprocess.run(
-            ["mcporter", "call", cmd],
+            [_mcporter_executable(), "call", cmd],
             capture_output=True, text=True, timeout=timeout,
         )
         if out.returncode != 0:

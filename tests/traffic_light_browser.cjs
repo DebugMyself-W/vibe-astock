@@ -62,7 +62,7 @@ function response(pathname, params = new URLSearchParams()) {
   if (pathname === "/api/market/live-emotion") return { available: true, date: "2026-08-27", as_of: "10:10:20", phase: "盘中",
     zt_count: 77, dt_count: 3, zb_count: 17, max_boards: 6, lianban_count: 13,
     seal_rate: .82, break_rate: .18, promotion_rate: .25, promotion_base: 52, emotion_regime: regime };
-  if (pathname === "/api/market/session") return { now: "2026-08-27 15:02", today: "2026-08-27", quotes_of: "2026-08-27", phase: "已收盘", label: "已收盘", is_today: true };
+  if (pathname === "/api/market/session") return { now: "2026-08-27 10:10", today: "2026-08-27", quotes_of: "2026-08-27", phase: "盘中", label: "盘中", is_today: true };
   if (pathname === "/api/market/overview") return { sentiment: { up: 3224, down: 1853, flat: 209,
     zt: 77, zt_real: 77, dt: 3, dt_real: 3, active: "61%", breadth: "偏强", speculation: "活跃", date: "2026-08-27" }, sectors: [], updated: "10:10" };
   if (pathname === "/api/market/emotion") return { date: "2026-08-26", zt_count: 52, dt_count: 2, zb_count: 20,
@@ -75,15 +75,35 @@ function response(pathname, params = new URLSearchParams()) {
       float_cap: 8e9, industry: "测试行业", seal_time: "09:45", last_seal_time: "09:45", break_count: 0,
       turnover_pct: 8, reason: "测试题材", traffic_light: settledStockLight }] };
   if (pathname === "/api/review/latest") return { target_date: "2026-08-27", generated_at: "2026-08-27 17:37 CST",
-    warnings: [], focus: null, emotion_metrics: {}, market_facts: { feedback_matrix: { available: true, details: [
+    warnings: [], focus: null, emotion_metrics: { ladder_gap: { available: true, highest: 2,
+    tiers: { "2": 1, "1": 3 }, gaps: [], continuous: true, note: "梯队完整" } }, market_facts: { feedback_matrix: { available: true, details: [
       { code: "600001", name: "测试股份", board: "10cm", prev_tier: "首板", ret: 10.01,
         result: "晋级涨停", sector: "测试行业", traffic_light: settledStockLight,
         next_session: { date: "2026-08-28", ret: 2.31, result: "收红", source: "next_review_feedback" } },
       { code: "600002", name: "旧档股票", board: "10cm", prev_tier: "首板", ret: -1.2,
         result: "小跌", sector: "测试行业" },
-    ] } }, emotion_regime: { ...regime, mode: "settled" },
+    ] }, theme_tree: { available: true, source_note: "题材诊断测试", tag_count: 1, covered: 1,
+      total_limit_up: 1, coverage_rate: 1, concentration: 1,
+      reason_meta: { source: "iwencai", fetched_at: "2026-08-27T15:30:00", cache_hit: true, settled: true },
+      themes: [{ tag: "测试题材", kind: "theme", state: "扩散中", limit_up: 1, first_boards: 0,
+        consec_boards: 1, highest: 2, broken: 0, limit_down: 0, broken_rate: 0,
+        first_seal: "0945", last_seal: "0945", prev_members: 1, prev_still_up: 1,
+        prev_broken_or_down: 0, continuation_rate: 1,
+        members: [{ code: "600001", name: "测试股份", boards: 2, first_seal: "0945", broken_times: 0 }] }] } },
+    iwencai_status: { configured: true, source_priority: ["iwencai"], intraday_refresh_minutes: 60,
+      day: "2026-08-27", requests_today: 3, successes_today: 2, failures_today: 1,
+      last_attempt_at: "2026-08-27T15:30:00", circuit_state: "rate_limited",
+      blocked_until: "2026-08-27T15:40:00", circuit_reason: "测试熔断" },
+    emotion_regime: { ...regime, mode: "settled" },
     board_traffic_light: { ...traffic, mode: "settled", stocks: undefined }, analysts: [] };
   if (pathname === "/api/review/dates") return { dates: ["2026-08-27"] };
+  if (pathname === "/api/review/followup") return { available: false, eligible: false, eval_date: null, times: [], snapshot: null, final: null, prediction: null, notes: [], status: { phase: "等待", enabled: false, delayed: false } };
+  if (pathname === "/api/review/ladder") return { available: true, date: "2026-08-27", count: 1, highest: 2,
+    tiers: [{ boards: 2, count: 1, stocks: [{ code: "600001", name: "测试股份", boards: 2,
+      pct: 10.01, industry: "测试行业", reason: "测试题材", seal_time: "09:45" }] }] };
+  if (pathname === "/api/review-agent/status") return { installed: true, subscription_ready: true, engine: "test", default_model: "test" };
+  if (pathname === "/api/review-agent/conversations") return [];
+  if (pathname === "/api/review-agent/catalog") return { targets: [] };
   if (pathname === "/api/market/overseas") return { available: false };
   if (pathname === "/api/indices") return [
     { name: "上证指数", price: 3500, change_pct: .3, change_amt: 10 },
@@ -127,20 +147,38 @@ function response(pathname, params = new URLSearchParams()) {
 
       await page.goto(`${base}/agent/review`, { waitUntil: "domcontentloaded" });
       await page.getByLabel("收盘打板红绿灯").waitFor();
+      await page.getByText("具体标的 · 1 只", { exact: true }).waitFor();
+      await page.getByText("问财今日 3 次 / 失败 1", { exact: false }).waitFor();
+      await page.getByText("熔断：测试熔断", { exact: false }).waitFor();
+      const stockLink = page.locator('a[title="打开同花顺 600001"]:visible').first();
+      await stockLink.waitFor();
+      assert.equal(await stockLink.getAttribute("href"), "https://stockpage.10jqka.com.cn/600001", `${name} stock link target is incorrect`);
       await page.getByText("展开明细（2 只，按今日表现从差到好）", { exact: true }).click();
       await page.getByText("次日涨幅", { exact: true }).waitFor();
       await page.getByText("晋级结果", { exact: true }).waitFor();
       await page.getByText("+2.31%", { exact: true }).waitFor();
       await page.getByText("未记录", { exact: true }).waitFor();
+      await page.getByTitle("按结果排序：跌停、跌超5%、小跌、收红、晋级涨停").first().click();
+      await page.getByLabel("选择测试股份").check();
+      assert.equal(await page.getByLabel("选中一键分析反馈股票").isEnabled(), true, `${name} batch deep dive remains disabled`);
+      assert.equal(await page.getByLabel("导出已勾选反馈股票").isEnabled(), true, `${name} feedback export remains disabled`);
+      await page.getByLabel("昨日强势股反馈跟踪备注").fill("回归测试备注");
+      assert.equal(await page.evaluate(() => localStorage.getItem("vibe-astock-feedback-tracking-note:2026-08-27")), "回归测试备注", `${name} feedback note was not persisted`);
       await page.getByLabel("测试股份 晋级候选，查看个股因子状况").click();
-      await page.getByRole("dialog", { name: "个股因子状况" }).getByText("四项质量因子通过 4/4。", { exact: true }).waitFor();
+      await page.getByRole("dialog", { name: "个股因子状况" }).getByText("四项质量因子通过 4/4。", { exact: false }).waitFor();
       await page.getByRole("dialog", { name: "个股因子状况" }).getByRole("button", { name: "关闭" }).click();
       assert(await page.locator("body").evaluate((body) => body.scrollWidth <= body.clientWidth + 1), `${name} review overflow`);
       await page.screenshot({ path: path.join(output, `${name}-review.png`), fullPage: true });
 
       await page.goto(`${base}/first-board`, { waitUntil: "domcontentloaded" });
-      await page.getByLabel("测试股份 晋级候选，查看个股因子状况").waitFor();
-      await page.getByText("暂缓新仓", { exact: true }).first().waitFor();
+      try {
+        await page.getByLabel("测试股份 临板质量通过，查看个股因子状况").waitFor();
+      } catch (error) {
+        await page.screenshot({ path: path.join(output, `${name}-first-board-failure.png`), fullPage: true });
+        console.error(`${name} first-board body:\n${(await page.locator("body").innerText()).slice(0, 4000)}`);
+        throw error;
+      }
+      await page.getByText("可进入个股筛选", { exact: true }).first().waitFor();
       assert(await page.locator("body").evaluate((body) => body.scrollWidth <= body.clientWidth + 1), `${name} first-board overflow`);
       await page.screenshot({ path: path.join(output, `${name}-first-board.png`), fullPage: true });
       assert.deepEqual(errors, []);

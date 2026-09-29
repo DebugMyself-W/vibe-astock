@@ -49,6 +49,28 @@ def _asof_note(date: str) -> str:
             "资金流/板块来自当前接口，并非独立历史快照，端点本身的时间戳未单独核实。）")
 
 
+def _historical_activity_fallback(date: str, label: str, groups=None,
+                                  primary_error: Exception | None = None) -> str:
+    """Use target-day history when the live-only board source is unavailable."""
+    try:
+        from .historical_sources import historical_activity
+
+        text = historical_activity(date, groups)
+        if primary_error is None:
+            return text
+        return (f"[历史补源] {label}实时主源不可用，已改用按 {date} 核验的板块成交与涨跌；"
+                "该口径不是历史主力净流入。\n" + text)
+    except Exception as fallback_error:
+        if primary_error is None:
+            return _degrade(f"{label}历史补源", date, fallback_error)
+        return _degrade_msg(
+            label,
+            date,
+            f"主源 {type(primary_error).__name__}: {primary_error}；"
+            f"历史补源 {type(fallback_error).__name__}: {fallback_error}",
+        )
+
+
 # ============ ① 情绪面 ============
 def get_sentiment_data(date: str, existing_metrics: Optional[dict] = None,
                        existing_facts: Optional[dict] = None) -> str:
@@ -240,11 +262,7 @@ def get_capital_data(date: str) -> str:
     from .trade_calendar import live_quotes_are_close_of
     matched, reason = live_quotes_are_close_of(date)
     if not matched:
-        try:
-            from .historical_sources import historical_activity
-            return historical_activity(date)
-        except Exception as exc:
-            return _degrade("资金面历史补源", date, exc)
+        return _historical_activity_fallback(date, "资金面")
     try:
         ind = dr.fetch_sector_flow("2")  # 行业
         dr.enrich_trend(ind)
@@ -275,7 +293,7 @@ def get_capital_data(date: str) -> str:
             return _degrade_msg("实时资金与板块", date, "取数期间行情日期已变化，本批未使用：" + reason)
         return "\n".join(lines) + _asof_note(date)
     except Exception as exc:  # noqa: BLE001
-        return _degrade("资金面", date, exc)
+        return _historical_activity_fallback(date, "资金面", primary_error=exc)
 
 
 # ============ 大板块本周 ============
@@ -283,11 +301,7 @@ def get_macro_sector_data(date: str) -> str:
     from .trade_calendar import live_quotes_are_close_of
     matched, reason = live_quotes_are_close_of(date)
     if not matched:
-        try:
-            from .historical_sources import historical_activity
-            return historical_activity(date, _MACRO_GROUPS)
-        except Exception as exc:
-            return _degrade("大板块历史补源", date, exc)
+        return _historical_activity_fallback(date, "大板块本周", _MACRO_GROUPS)
     try:
         concept = dr.fetch_sector_flow("3")  # 概念
         dr.enrich_trend(concept)
@@ -307,7 +321,9 @@ def get_macro_sector_data(date: str) -> str:
             return _degrade_msg("实时资金与板块", date, "取数期间行情日期已变化，本批未使用：" + reason)
         return "\n".join(lines) + _asof_note(date)
     except Exception as exc:  # noqa: BLE001
-        return _degrade("大板块本周", date, exc)
+        return _historical_activity_fallback(
+            date, "大板块本周", _MACRO_GROUPS, primary_error=exc
+        )
 
 
 # ============ ③ 题材热点（涨停原因题材串）============

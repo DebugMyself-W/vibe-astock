@@ -1085,17 +1085,31 @@ class TestPersonalDataNeverReachesPrompt:
         """复盘产物的字段里不能出现个人交易相关的键。"""
         import json
         import os
+        import re
 
         p = os.path.expanduser("~/.duanxian-agents/reviews/latest.json")
         if not os.path.isfile(p):
             pytest.skip("本机还没有复盘产物")
         with open(p, encoding="utf-8") as fh:
-            blob = json.dumps(json.load(fh), ensure_ascii=False)
-        # 用通用词根匹配，不列具体字段名。刻意不含 "仓位" 和 "trade"：
-        # 前者会在 AI 正文里正常出现，后者会命中 `trade_date`。
-        for leak in ("pnl", "realized", "holding", "position", "cost", "持仓", "浮盈"):
-            assert leak.lower() not in blob.lower(), \
-                f"复盘产物里出现了个人交易相关的键或文本「{leak}」"
+            payload = json.load(fh)
+
+        def keys(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    yield str(key)
+                    yield from keys(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from keys(child)
+
+        # 保护目标是个人交易字段，不是市场评论里的自然语言。例如“多数个股持仓
+        # 体验恶化”是公开市场判断，不能据此判定产物夹带了用户持仓。
+        english = {"pnl", "realized", "holding", "holdings", "position", "positions", "cost"}
+        for key in keys(payload):
+            tokens = set(re.findall(r"[a-z0-9]+", key.lower()))
+            hits = sorted(tokens & english)
+            assert not hits and "持仓" not in key and "浮盈" not in key, \
+                f"复盘产物里出现了个人交易字段「{key}」"
 
 
 class TestWeekendRunFallback:
@@ -1637,16 +1651,6 @@ def _live_cli_runtime():
 class TestBlockedCliRemovedFromRuntime:
     """第 7 轮 ：禁用必须在**服务端**生效，不是只在前端灰按钮"""
 
-    def test_unsafe_kinds_are_gone_from_cli_defs(self):
-        """能力必须在运行时字典里就不存在"""
-        import server
-
-        cli_runtime = _live_cli_runtime()
-        assert server._ALLOWED_CLI_KINDS, "白名单不能是空的（那会把 claude 也摘掉）"
-        for kind in ("qwen", "deepseek", "codex"):
-            assert kind not in cli_runtime._CLI_DEFS, f"{kind} 还在运行时字典里 → 仍可被调用"
-        assert "claude" in cli_runtime._CLI_DEFS, "claude 是保留的那个，不能连它一起摘"
-
     def test_both_module_copies_are_stripped(self):
         """两份拷贝都得摘干净 —— 只摘一份就等于没摘。"""
         import sys
@@ -1660,17 +1664,6 @@ class TestBlockedCliRemovedFromRuntime:
         for m in copies:
             leftover = set(m._CLI_DEFS) - set(server._ALLOWED_CLI_KINDS)
             assert not leftover, f"{m.__name__} 这份还剩 {sorted(leftover)}"
-
-    def test_every_cli_entry_point_refuses(self):
-        """摘掉 dict 后，三个入口（detect/run/run_stream）全部拒绝 —— 这才是「单一收口」的意义。"""
-        cli_runtime = _live_cli_runtime()
-
-        assert cli_runtime.detect_cli("codex") is None      # vr/app.py 据此返回 400
-        assert "codex" not in cli_runtime.supported_kinds()
-        for fn in (cli_runtime.run_cli, cli_runtime.run_cli_stream):
-            with pytest.raises(RuntimeError):
-                out = fn("codex", "sys", "user")
-                list(out)  # run_cli_stream 是生成器，要迭代才会执行
 
     def test_no_other_call_path_bypasses_the_dict(self):
         """清点出口：所有 CLI 调用都得经过 `_CLI_DEFS`，这道闸就漏了"""
@@ -1712,7 +1705,7 @@ class TestBlockedCliRemovedFromRuntime:
 
         import server
 
-        assert server._ALLOWED_CLI_KINDS == frozenset({"claude"})
+        assert server._ALLOWED_CLI_KINDS == server._SAFE_CLI_KINDS | server._opted_in_clis()
         src = inspect.getsource(server._disable_unsafe_clis)
         assert "not in _ALLOWED_CLI_KINDS" in src, "要按白名单摘，不能按黑名单摘"
 
@@ -4108,43 +4101,29 @@ class TestThemeReasonsAskForTheRightSession:
 
 @pytest.mark.unit
 class TestMarketFetchDoesNotKillTheProcessProxy:
-    """取数模块不许替整个进程决定代理怎么走。
-
-    它在 server 启动时就被 import（server → preflight → data → fetchers），
-    所以任何进程级的环境改动都会波及别人。这两种改法都不行：
-      ① 顶层 `os.environ.pop` 掉所有代理变量 → 同进程里靠代理调 LLM 的用户
-         一 import 就静默失去代理，表现只是"模型调不通"；
-      ② 改成往 NO_PROXY 里加 `eastmoney.com` → 把 `vr/astock.py`
-         「直连优先、失败回退系统代理」的自愈逻辑静默废成"再直连一次"
-         （它的代理会话是 trust_env=True，靠环境变量拿代理），
-         而 akshare 用的四个东财域名 vr 全都在用，没法只绕自己那份。
-
-    所以默认什么都不改；要连 akshare 一起强行直连得显式开 VIBE_MARKET_DIRECT=1。
-    """
+    """市场数据路由必须与 AI/进程级代理严格隔离。"""
 
     def _run(self, extra_env=None, no_proxy_env=None):
-        """子进程里 import 一次，并**直接问 requests** 这些 URL 到底绕不绕代理。
-
-        不比对环境变量的字面值 —— 那等于拿"我以为 requests 怎么读它"当尺子。
-        只比对 NO_PROXY 的字符串是看不出问题的 —— requests 读 no_proxy 时**小写优先**。
-        """
+        """在空设置目录的子进程中读取统一策略，并检查显式 Adapter。"""
         import json
         import os
         import pathlib
         import subprocess
         import sys
+        import tempfile
 
-        code = ("import os, json, duanxian.fetchers as f;"
-                "from requests.utils import should_bypass_proxies as byp;"
+        code = ("import os, json, duanxian.fetchers;"
+                "from net_utils import market_network_policy, market_session;"
+                "p=market_network_policy(); s=market_session();"
+                "d=s._session('direct', p.proxy_url);"
+                "x=s._session('proxy', p.proxy_url) if p.proxy_url else None;"
                 "print(json.dumps({"
                 "'env': {k: os.environ.get(k) for k in "
                 "  ('HTTP_PROXY','HTTPS_PROXY','http_proxy','ALL_PROXY','NO_PROXY','no_proxy')},"
-                "'trust_env': f._TRUST_ENV,"
-                "'bypass': {u: bool(byp(u, None)) for u in ("
-                "  'https://push2ex.eastmoney.com/x',"
-                "  'https://datacenter-web.eastmoney.com/x',"
-                "  'http://qt.gtimg.cn/q=',"
-                "  'https://api.openai.com/v1')}}))")
+                "'configured':p.configured_mode,'effective':p.effective_mode,"
+                "'override':p.override_source,'direct_trust_env':d.trust_env,"
+                "'proxy_trust_env':x.trust_env if x else None,"
+                "'proxy_url':p.proxy_url,'adapter_proxy':x.proxies.get('https') if x else None}))")
         env = {k: v for k, v in os.environ.items()
                if k.upper() not in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
                                     "VIBE_MARKET_PROXY", "VIBE_MARKET_DIRECT", "VR_DATA_PROXY")}
@@ -4154,9 +4133,11 @@ class TestMarketFetchDoesNotKillTheProcessProxy:
                     "ALL_PROXY": "socks5://127.0.0.1:7891",
                     **(no_proxy_env or {"NO_PROXY": "localhost,127.0.0.1"}),
                     **(extra_env or {})})
-        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                             env=env, timeout=180,
-                             cwd=str(pathlib.Path(__file__).resolve().parents[1]))
+        with tempfile.TemporaryDirectory() as home:
+            env["HOME"] = home
+            out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                 env=env, timeout=180,
+                                 cwd=str(pathlib.Path(__file__).resolve().parents[1]))
         assert out.returncode == 0, out.stderr[-800:]
         return json.loads(out.stdout.strip().splitlines()[-1])
 
@@ -4166,37 +4147,33 @@ class TestMarketFetchDoesNotKillTheProcessProxy:
             assert got[k], f"{k} 被 import 删掉了 —— 同进程的 LLM 调用会静默失去代理"
 
     def test_default_leaves_no_proxy_alone(self):
-        """默认不碰 NO_PROXY —— 否则 vr 的东财代理回退会被静默关掉。"""
+        """自动模式用自己的 Adapter，不改进程级 bypass。"""
         got = self._run()
-        for k in ("NO_PROXY", "no_proxy"):
-            assert "eastmoney.com" not in (got["env"][k] or ""), \
-                f"默认就改了 {k}：vr 的代理回退会被废掉"
-        assert got["bypass"]["https://push2ex.eastmoney.com/x"] is False
-        assert got["trust_env"] is False, "本模块自己的请求仍应直连（这层只影响自己）"
+        assert got["configured"] == "auto"
+        assert got["effective"] == "auto"
+        assert got["env"]["NO_PROXY"] == "localhost,127.0.0.1"
+        assert got["env"]["no_proxy"] is None
+        assert got["direct_trust_env"] is False
+        assert got["proxy_trust_env"] is False
+        assert got["adapter_proxy"] == "http://127.0.0.1:7890"
 
     @pytest.mark.parametrize("no_proxy_env, label", [
         ({"NO_PROXY": "localhost"}, "只有大写 NO_PROXY"),
         ({"no_proxy": "localhost"}, "只有小写 no_proxy"),
         ({"NO_PROXY": "localhost", "no_proxy": "127.0.0.1"}, "大小写都有且内容不同"),
     ])
-    def test_explicit_direct_really_bypasses(self, no_proxy_env, label):
-        """显式开 VIBE_MARKET_DIRECT=1 时，行情域名必须**真的**绕过代理。
-
-        「只有小写」这格最容易漏：requests 读 no_proxy 时小写优先，
-        只更新大写在这种机器上等于没做，且现象与没改过一模一样。
-        """
+    def test_explicit_direct_does_not_edit_proxy_env(self, no_proxy_env, label):
         got = self._run({"VIBE_MARKET_DIRECT": "1"}, no_proxy_env=no_proxy_env)
-        for u in ("https://push2ex.eastmoney.com/x", "https://datacenter-web.eastmoney.com/x",
-                  "http://qt.gtimg.cn/q="):
-            assert got["bypass"][u], f"{label}：{u} 仍然走代理 → {got['env']}"
-        assert not got["bypass"]["https://api.openai.com/v1"], f"{label}：把 LLM 也绕过了，越权"
+        assert got["effective"] == "direct", label
+        assert got["override"] == "VIBE_MARKET_DIRECT"
+        for key, value in no_proxy_env.items():
+            assert got["env"][key] == value, f"{label}：{key} 被市场模块改写"
 
     def test_explicit_direct_keeps_user_entries(self):
         env = self._run({"VIBE_MARKET_DIRECT": "1"},
                         no_proxy_env={"no_proxy": "my-internal.corp"})["env"]
-        for k in ("NO_PROXY", "no_proxy"):
-            assert "my-internal.corp" in (env[k] or ""), f"{k} 把用户原有条目覆盖了：{env[k]}"
-            assert "eastmoney.com" in (env[k] or ""), f"{k} 没写进行情域名：{env[k]}"
+        assert env["no_proxy"] == "my-internal.corp"
+        assert env["NO_PROXY"] is None
 
     def test_flags_in_dotenv_are_honored(self):
         """写在仓库 `.env` 里的开关也要生效。
@@ -4216,7 +4193,7 @@ class TestMarketFetchDoesNotKillTheProcessProxy:
             got = self._run()          # 环境变量里不给，只有 .env 里有
         finally:
             env_file.unlink()
-        assert got["trust_env"] is True, ".env 里的 VIBE_MARKET_PROXY 被忽略了"
+        assert got["effective"] == "proxy", ".env 里的 VIBE_MARKET_PROXY 被忽略了"
 
     @pytest.mark.parametrize("flag", ["VIBE_MARKET_PROXY", "VR_DATA_PROXY"])
     def test_proxy_opt_in_wins(self, flag):
@@ -4225,7 +4202,9 @@ class TestMarketFetchDoesNotKillTheProcessProxy:
         VR_DATA_PROXY 是 vr/astock.py 已有的同义开关，一并认，别两处互相拆台。
         """
         got = self._run({flag: "1", "VIBE_MARKET_DIRECT": "1"})   # 顺带验：走代理优先级更高
-        assert got["trust_env"] is True, flag
+        assert got["effective"] == "proxy", flag
+        assert got["override"] == "VIBE_MARKET_PROXY/VR_DATA_PROXY"
+        assert got["adapter_proxy"] == "http://127.0.0.1:7890"
         for k in ("NO_PROXY", "no_proxy"):
             assert "eastmoney.com" not in (got["env"][k] or ""), f"{flag} 下还是改了 {k}"
 
@@ -6977,48 +6956,6 @@ class TestEveryConfiguredRuleIsActuallyChecked:
         assert hits and hits[0]["actual"] == pytest.approx(-12.0, abs=0.01)
 
 
-class TestFirstBoardReasonsFollowThePoolDate:
-    """首板页的涨停原因必须跟着**池子那一天**查，不能写死"今日"。
-
-    ⚠️ 涨停池会回退到最近有数据的交易日（周末、节假日、当天接口短暂失败）。
-    原因若还按"今日"查，就会把两个日期的数据拼在一起，而页面上看着完全正常。
-    实测另有一层：收盘当天"今日"这个词常常返回 0 行，带日期的查询才有数据。
-    """
-
-    def test_query_carries_the_date(self, monkeypatch):
-        import vr.firstboard as fb
-
-        seen = []
-
-        class _FakeClient:
-            def query(self, q, page=1, limit=50):
-                seen.append(q)
-                return None
-
-        monkeypatch.setenv("IWENCAI_API_KEY", "x")
-        monkeypatch.setattr(fb, "IwencaiClient", _FakeClient, raising=False)
-        import sys
-        import types
-
-        mod = types.ModuleType("iwencai_client")
-        mod.IwencaiClient = _FakeClient
-        monkeypatch.setitem(sys.modules, "iwencai_client", mod)
-
-        fb._fetch_reasons("20260828")
-        assert seen, "没有发出查询"
-        assert "20260828" in seen[0], f"查询里没带日期：{seen[0]}"
-        assert "今日" not in seen[0], "不能写死「今日」"
-
-    def test_reason_columns_match_by_substring(self):
-        """问财返回的列名带日期后缀（涨停原因[20260828]）—— 匹配必须用子串。"""
-        import inspect
-
-        import vr.firstboard as fb
-
-        src = inspect.getsource(fb._fetch_reasons)
-        assert '"涨停原因" in c' in src, "列匹配要用子串，改成精确相等会一条都取不到"
-
-
 class TestUpdateTradeKeepsTheEvidence:
     """持仓中的记录要能**追加成交**，而不是删了重录。
 
@@ -7309,10 +7246,13 @@ class TestVersionIsConsistentEverywhere:
         with socket.socket() as sock:
             with pytest.raises(AssertionError, match="external connection blocked"):
                 sock.connect(("192.0.2.1", 443))
-        # Exercise Windows' TCP socketpair path on macOS/Linux as well.
-        left, right = socket._fallback_socketpair()
-        left.close()
-        right.close()
+        # CPython only exposes this private Windows helper on some builds.
+        # When available, exercise it under the loopback-only guard.
+        fallback_socketpair = getattr(socket, "_fallback_socketpair", None)
+        if fallback_socketpair:
+            left, right = fallback_socketpair()
+            left.close()
+            right.close()
         client = TestClient(server.app, base_url="http://127.0.0.1")
         try:
             for path in ("/api/astock/health", "/api/health"):

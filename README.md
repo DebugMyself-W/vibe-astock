@@ -147,6 +147,8 @@ Windows 也在本机浏览器中使用；需要安装 Python（含 `py` 启动�
 
 先到「接入 AI」完成登录或填写自己的 API 配置，测试成功后保存。查看行情与已有记录不要求先生成 AI 报告；启动服务也不会自动生成复盘。连接测试和 AI 任务可能消耗所选服务的额度。
 
+同页的「市场数据网络」统一控制腾讯、东财、新浪、巨潮、问财和研究数据的 HTTP 出口：推荐使用“自动”（WSL 直连失败后回退 Clash），也可固定直连或固定代理，并一键分别检测 WSL 直连和 Windows Clash。WSL NAT 网络下代理地址通常应填写 Windows 主机网关而非 `127.0.0.1`，同时需在 Clash 开启 Allow LAN。该设置只作用于市场数据请求，不修改进程级 `HTTP_PROXY` / `NO_PROXY`，不会改变 Codex、Claude 等 AI 连接。通达信和 Baostock 使用 TCP，不经过 HTTP 代理，失败时按各数据源既有降级策略处理。
+
 源码更新前停止服务并备份下节列出的数据；保留本地修改，更新后重新运行 `sh scripts/setup` 与 `sh scripts/doctor`。日志位于 `.local/startup.log`，分享日志前检查个人信息。
 
 本地后台提供 macOS、Linux 和 Windows 启动路径。Windows 原生安装、进程清理和网页重启的自动验收结果见[验证范围](#验证范围)；各供应商需使用自己的账户或密钥完成连接测试。
@@ -241,6 +243,104 @@ v1.1.3 发布检查：macOS 后端三目录 **1287 项通过、4 项 Windows 专
 node --test frontend/test/*.test.ts
 npm --prefix frontend run build
 ```
+
+## 本 fork 的二开维护与会话接手说明
+
+> 更新于 2026-09-28。本节记录当前本地 fork 的运行环境、已恢复能力、关键实现和接手顺序，供后续开发对话继续工作。它不是上游发布承诺；合并上游时仍以上游工程的正确性和新版功能可用性为第一优先级，再逐项恢复本节所列二开能力。
+
+### 当前部署拓扑
+
+- 仓库在 Windows 的 `D:\workspace\vibe-astock`，WSL 中对应 `/mnt/d/workspace/vibe-astock`。
+- Python 服务运行在 WSL，Windows 浏览器访问 `http://localhost:8910`。排查问题时必须区分“Windows 浏览器能访问”与“WSL 服务能出站取数”，二者不是同一条网络路径。
+- Windows 使用 Clash。市场数据统一由「接入 AI → 市场数据网络」控制，推荐保持“自动”：先尝试 WSL 直连，连接失败、被重置或受限后再尝试 Clash。不要在腾讯、东财、新浪、巨潮、问财等功能中各自增加代理逻辑。
+- 当前环境曾检测到 `http://127.0.0.1:7890`，但 WSL NAT、镜像网络和 Clash 的 Allow LAN 设置变化后地址可能不同；新会话应以设置页的一键诊断结果为准，不能硬编码这个地址。
+- HTTP 市场数据走 `net_utils.py` 的统一网络缝隙；通达信与 Baostock 使用 TCP，不经过 HTTP/Clash 代理。
+
+### 本轮上游合并后的恢复顺序与状态
+
+本 fork 曾在合并上游后丢失部分二开界面与数据链。恢复顺序固定如下，后续再次同步上游时也按此顺序回归：
+
+1. **历史复盘核心**：红绿灯、梯队详情、次日跟踪。
+2. **昨日强势股反馈**：排序、勾选、批量深挖、龙虎榜、导出、备注。
+3. **定时复盘设置**：启停、执行时间、失败状态与重试。
+4. **股票跳转与题材诊断**：统一股票链接、板块归属、概念成分与热门概念命中。
+
+截至本节更新时间，上述界面已恢复。历史报告与深挖报告按版本保存，不会被新版算法自动改写；需要新版字段时应重新生成报告，不能把旧报告当作已重新验收。
+
+本轮还完成了以下二开修复：
+
+- 复盘历史场次重新展示红绿灯、梯队抽屉、同行业/概念成员、昨日强势股反馈和次日观察数据；失败来源保留明确提示，不用空值伪装正常。
+- 个股弹窗直接复用个股研究页的 `StockConceptCard`，展示同一套“板块归属 · 概念”和“当下热门概念命中”，禁止另写一套概念判断算法。
+- 多空辩论保存不可变历史版本，支持按标的查看多次报告和经确认后删除；“最近完成报告”只是快捷入口，不代表只保存一份。
+- 深挖题材数据直接调用 `vr/astock.py` 中现有的 `concept_blocks()` 与 `hot_concepts()`；问财只做补充。东财 `slist` 使用相同算法在官方镜像间降级，单次连接重置不能被解释为“该股没有概念”。
+- 问财密钥可在设置页保存、替换、清除。密钥写入 WSL 当前用户的 `~/.duanxian-agents/credentials.json`，文件权限为 `0600`；API 只返回是否配置和来源，绝不回显密钥。旧 `.env` 仍兼容，设置页的“清除并停用”可以显式覆盖旧 `.env` 值。
+- 问财密钥会按最小范围传给需要它的复盘/深挖隔离 worker。此前“设置页显示已配置，但深挖子进程取不到”的问题已修复。
+- WSL 服务没有继承 NVM PATH 时，会从 `~/.nvm/versions/node/*/bin/mcporter` 定位命令。当前机器尚未给 mcporter 配置名为 `exa` 的 MCP server，因此 Agent-Reach 全网资讯属于可选缺口；它不得阻断板块归属、热门概念或问财题材结果。
+- 网络诊断现在检查真实使用的东财板块归属端点，而不是只检查一个无关的延时行情端点。新浪延迟可能因 DNS/TCP/TLS/CDN 抖动出现秒级变化，应对照直连与代理的多次结果判断，不能凭一次耗时认定代码故障。
+
+### 接手时先做的检查
+
+不要一上来重新合并、覆盖目录或重写算法。先保留当前脏工作区并确认运行事实：
+
+```bash
+cd /mnt/d/workspace/vibe-astock
+git status --short
+curl -sS http://127.0.0.1:8910/api/health
+curl -sS http://127.0.0.1:8910/api/settings
+curl -sS "http://127.0.0.1:8910/api/blocks?code=603248"
+curl -sS "http://127.0.0.1:8910/api/hot-concepts?code=603248"
+curl -sS -X POST http://127.0.0.1:8910/api/settings/market-network/diagnose
+```
+
+`/api/settings` 不得返回任何密钥明文。若接口正常但浏览器仍显示旧界面，先确认 `frontend/dist/` 已重新构建并强制刷新 Windows 浏览器；若浏览器能开页面但取数失败，再检查 WSL 内的诊断结果、服务日志和 Clash 路由。
+
+验证深挖题材 worker 时可使用一个公开标的做只读检查：
+
+```bash
+timeout 70s .venv/bin/python -m review_agent.public_worker get_theme '["603248","锡华科技"]'
+```
+
+期望结果至少包含“板块归属 · 概念”和“当下热门概念命中”。配置了有效问财密钥时还应出现“问财补充”；Agent-Reach 不可用只能作为独立提示，不能把前述结果清空。
+
+本轮修复的重点回归命令为：
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_iwencai_settings_and_deepdive.py \
+  tests/test_market_network.py \
+  tests/test_market_data_fallbacks.py \
+  tests/test_deepdive_alignment.py \
+  tests/test_theme_reasons_gateway.py \
+  tests/test_issue_regressions.py -q
+npm run build --prefix frontend
+git diff --check
+```
+
+2026-09-27 的最后一次相关回归为 **73 项通过**，前端生产构建通过；这只是本轮相关测试，不等同于仓库全量测试。构建仍有既有的大 chunk 提示，pytest 在当前挂载盘上可能因 `.pytest_cache` 权限产生警告，二者当时均未导致失败。
+
+### 关键代码入口
+
+| 入口 | 维护职责 |
+|---|---|
+| `net_utils.py`、`duanxian/app_settings.py` | 市场数据统一直连/代理策略、状态与诊断 |
+| `duanxian/data_credentials.py` | 问财私有密钥落盘、停用覆盖与只返回状态 |
+| `duanxian/fetchers.py`、`duanxian/theme_reasons.py` | `.env` 兼容、问财网关、缓存与熔断状态 |
+| `review_agent/public_worker.py` | 隔离取数 worker 的最小环境和密钥传递边界 |
+| `duanxian/deepdive/data.py` | 多空辩论使用的行情、K 线、龙虎榜和题材材料 |
+| `vr/astock.py` | 个股研究与深挖共用的板块归属、热门概念等真实数据算法 |
+| `frontend/src/components/StockConceptCard.tsx` | 个股研究与复盘个股弹窗共用的概念展示 |
+| `frontend/src/pages/Settings.tsx`、`server.py` | 网络/问财设置界面及受鉴权、来源校验保护的 API |
+| `review_agent/deepdive.py`、`review_agent/api.py`、`frontend/src/pages/DeepDive.tsx` | 多空辩论历史版本、读取与删除 |
+
+### 后续修改约束
+
+- 同步上游前先记录本地状态并备份用户数据；优先逐文件合并，不整目录覆盖 `vr/`、`duanxian/`、`review_agent/` 或前端页面。
+- 不要为某个页面私建代理开关；所有 HTTP 市场数据必须复用统一网络层。AI 登录网络与市场数据网络保持隔离。
+- 不要将数据源异常转换成零、空榜或正常状态。报告必须区分“真实为空”“接口失败”“历史日期不可补取”和“样本范围有限”。
+- 不要复制“板块归属/热门概念”算法。个股研究、复盘弹窗和深挖报告应共享现有函数或组件。
+- 不要在聊天、README、日志、测试夹具或 Git 中写入真实问财 key、AI key、OAuth token 或代理账号密码；需要更新问财 key 时使用设置页。
+- 诊断或修复数据问题时先复现并写回归测试，再修改实现；真实接口验证只做必要的只读请求，并注明交易日、历史日和实时行情的口径差异。
+- 工作区可能包含用户尚未提交的二开修改。接手者必须先查看差异并保留无关改动，禁止使用 `git reset --hard` 或整树覆盖来“恢复干净”。
 
 ## 更新日志
 

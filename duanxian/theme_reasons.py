@@ -196,6 +196,16 @@ def current_status() -> dict:
     }
 
 
+def reset_runtime_status() -> None:
+    """Make a newly saved key usable immediately without restarting."""
+    global _AUTH_KEY_VALUE
+    _AUTH_KEY_VALUE = None
+    with _STATE_LOCK:
+        status = _load_status()
+        status["breaker"] = None
+        _persist_status()
+
+
 def _cache_path(date: str) -> str:
     return os.path.join(_CACHE_DIR, f"{date}.json")
 

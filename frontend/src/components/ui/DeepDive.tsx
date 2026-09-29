@@ -1,15 +1,15 @@
 // 「AI 深入分析」共享单元：行内展开的流式分析面板（首板分析 / 每日复盘连板表共用）。
 // useDeepDive 管理展开态 + 流式请求 + 本地存档 + 一键全部分析；DeepDivePanel 渲染表格内的展开行。
 // 存档只存本地 localStorage（与研究记录同体系，不上传、不进仓库），按「日期|页面|代码」为键，
-// 自动保留本次写入日与其他最近 4 个交易日 —— 分析过的股票刷新页面后按钮变「展开」，不再重复花模型调用。
+// 自动清理只保留最近 5 个交易日 —— 分析过的股票刷新页面后按钮变「展开」，不再重复花模型调用。
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { Loader2, RefreshCw, Sparkles } from "lucide-react";
+import { Loader2, RefreshCw, Sparkles, Square } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { hasLlm, chatStream } from "@/lib/llm";
-import { readMode } from "@/lib/workspace/state";
+import { loadAgentConnection } from "@/lib/agent-api";
 
 const TOOL_LABEL: Record<string, string> = {
   query_quote: "查行情",
@@ -21,10 +21,11 @@ const TOOL_LABEL: Record<string, string> = {
 
 // ---------- 本地存档 ----------
 const STORE_KEY = "vr-deepdive";
-const KEEP_DAYS = 5; // 当前写入日优先，历史回看不能刚保存就被淘汰
+const KEEP_DAYS = 5; // 只保留最近 5 个不同交易日的分析
 
 interface DiveRecord {
   text: string;
+  name?: string;
   tools: string[];
   ts: number;
 }
@@ -35,26 +36,28 @@ function loadStore(): Store {
   try {
     const v = JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
     if (!v || typeof v !== "object" || Array.isArray(v)) return {};
-    return Object.fromEntries(Object.entries(v).filter(([, r]) =>
-      r && typeof r === "object" && typeof (r as DiveRecord).text === "string" &&
-      Array.isArray((r as DiveRecord).tools) && (r as DiveRecord).tools.every(t => typeof t === "string"))) as Store;
+    return Object.fromEntries(Object.entries(v).filter(([, record]) => {
+      const r = record as DiveRecord | null;
+      return r && typeof r.text === "string" && r.text.trim() && Array.isArray(r.tools);
+    })) as Store;
   } catch {
     return {};
   }
 }
 
-function persistStore(store: Store, day: string) {
+function persistStore(store: Store) {
   // 清理：按 key 前缀日期，只保留最近 KEEP_DAYS 个交易日
   const dates = [...new Set(Object.keys(store).map((k) => k.split("|")[0]))].sort().reverse();
-  const keep = new Set([day, ...dates.filter(d => d !== day).slice(0, KEEP_DAYS - 1)]);
+  const keep = new Set(dates.slice(0, KEEP_DAYS));
   const next: Store = {};
   for (const [k, v] of Object.entries(store)) {
     if (keep.has(k.split("|")[0])) next[k] = v;
   }
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify(next));
+    return true;
   } catch {
-    throw new Error("分析已生成，但本机存储空间不足，未能存档；请先复制结果保存。");
+    return false;
   }
 }
 
@@ -63,187 +66,231 @@ const normDate = (d: string) => d.split("-").join(""); // '2026-07-15' / '202607
 // ---------- hook ----------
 export interface DiveItem {
   key: string;      // 一般用股票代码
+  name?: string;
   prompt: string;
   context: string;
+  /** 在模型调用前补充客观数据；用于 CLI 等不能自主 function-call 的接入方式。 */
+  prepareContext?: () => Promise<string>;
 }
 
 export interface DeepDiveState {
+  date: string;
+  names: Record<string, string>;
   open: string | null;
   analysis: Record<string, string>;
-  completed: Record<string, boolean>;
   tools: Record<string, string[]>;
   running: string | null;
+  runningKeys: string[];
+  queuedKeys: string[];
+  completed: Record<string, boolean>;
+  errors: Record<string, string>;
+  busy: boolean;
+  storageError: string | null;
+  batchSummary: string | null;
   aiErr: string | null;
   needConfig: boolean;
-  batch: { done: number; total: number; current: string } | null; // 一键全部分析进度
+  batch: { done: number; total: number; active: string[]; failed: number } | null;
   toggle: (item: DiveItem) => void;
   rerun: (item: DiveItem) => void;
-  runAll: (items: DiveItem[]) => void;
+  runAll: (items: DiveItem[], concurrency?: number) => void;
   stopAll: () => void;
 }
 
 export function useDeepDive(ns: string, date: string): DeepDiveState {
+  const [recordDate, setRecordDate] = useState("");
+  const [names, setNames] = useState<Record<string, string>>({});
   const [open, setOpen] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<Record<string, string>>({});
+  const [tools, setTools] = useState<Record<string, string[]>>({});
+  const [runningKeys, setRunningKeys] = useState<string[]>([]);
+  const [queuedKeys, setQueuedKeys] = useState<string[]>([]);
   const [completed, setCompleted] = useState<Record<string, boolean>>({});
   const completedRef = useRef<Record<string, boolean>>({});
-  const batchActive = useRef(false);
-  const epoch = useRef(0);
-  const [tools, setTools] = useState<Record<string, string[]>>({});
-  const [running, setRunning] = useState<string | null>(null);
-  const [aiErr, setAiErr] = useState<string | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const unsavedRef = useRef(new Set<string>());
+  const [batchSummary, setBatchSummary] = useState<string | null>(null);
   const [needConfig, setNeedConfig] = useState(false);
   const [batch, setBatch] = useState<DeepDiveState["batch"]>(null);
-  const acRef = useRef<AbortController | null>(null);
-  const batchStopRef = useRef(false);
+  const controllers = useRef(new Map<string, AbortController>());
+  const generationRef = useRef(0);
+  const batchRef = useRef(false);
   const day = normDate(date);
 
   // 日期就绪/变化时：载入该日该页面的存档
   useEffect(() => {
-    epoch.current += 1;
-    batchStopRef.current = true;
-    acRef.current?.abort();
-    batchActive.current = false;
-    setBatch(null);
-    setAnalysis({}); setTools({}); completedRef.current = {}; setCompleted({});
-    if (!day) return;
     const store = loadStore();
     const prefix = `${day}|${ns}|`;
     const a: Record<string, string> = {};
     const t: Record<string, string[]> = {};
+    const n: Record<string, string> = {};
     for (const [k, v] of Object.entries(store)) {
       if (k.startsWith(prefix)) {
         const code = k.slice(prefix.length);
         a[code] = v.text;
         t[code] = v.tools;
+        if (typeof v.name === "string") n[code] = v.name;
       }
     }
-    completedRef.current = Object.fromEntries(Object.keys(a).filter(k => a[k]?.trim()).map(k => [k, true]));
-    setCompleted(completedRef.current);
     setAnalysis(a);
+    setRecordDate(day);
+    setNames(n);
     setTools(t);
+    completedRef.current = Object.fromEntries(Object.keys(a).map((key) => [key, true]));
+    setCompleted(completedRef.current);
+    setOpen(null); setErrors({}); setRunningKeys([]); setQueuedKeys([]);
+    setBatch(null); setBatchSummary(null); setNeedConfig(false); setStorageError(null);
+    unsavedRef.current.clear();
+    batchRef.current = false;
+    return () => {
+      generationRef.current += 1;
+      for (const ac of controllers.current.values()) ac.abort();
+      controllers.current.clear();
+      batchRef.current = false;
+    };
   }, [ns, day]);
 
-  useEffect(() => () => { batchStopRef.current = true; acRef.current?.abort(); }, []);
-
-  const saveRecord = (code: string, text: string, toolList: string[]) => {
+  const saveRecord = (code: string, text: string, toolList: string[], name?: string) => {
     if (!day || !text.trim()) return;
     const store = loadStore();
-    store[`${day}|${ns}|${code}`] = { text, tools: toolList, ts: Date.now() };
-    persistStore(store, day);
+    store[`${day}|${ns}|${code}`] = { text, tools: toolList, ts: Date.now(), name };
+    if (name) setNames((current) => ({ ...current, [code]: name }));
+    if (persistStore(store)) unsavedRef.current.delete(code);
+    else unsavedRef.current.add(code);
+    setStorageError(unsavedRef.current.size ? "浏览器存储不可写，本次结果仅在当前页面保留" : null);
+  };
+
+  const markComplete = (key: string, value: boolean) => {
+    completedRef.current = { ...completedRef.current, [key]: value };
+    setCompleted(completedRef.current);
   };
 
   /** 跑一只。expand=true 时展开面板（单只点击）；批量模式传 false 只后台跑。成功返回 true。 */
-  const start = async (item: DiveItem, expand: boolean): Promise<boolean> => {
-    setAiErr(null);
+  const start = async (item: DiveItem, expand: boolean, generation = generationRef.current): Promise<boolean> => {
+    if (generation !== generationRef.current || controllers.current.has(item.key)) return false;
+    setErrors((m) => ({ ...m, [item.key]: "" }));
     setNeedConfig(false);
-    if (!day) { setOpen(item.key); setAiErr("交易日期尚未就绪，请等待数据加载"); return false; }
     if (expand) setOpen(item.key);
     if (!hasLlm()) {
       setNeedConfig(true);
       if (!expand) setOpen(item.key); // 批量时也把配置提示亮出来
       return false;
     }
-    acRef.current?.abort();
     const ac = new AbortController();
-    acRef.current = ac;
-    setRunning(item.key);
-    completedRef.current = { ...completedRef.current, [item.key]: false };
-    setCompleted(completedRef.current);
+    controllers.current.set(item.key, ac);
+    const current = () => !ac.signal.aborted && generation === generationRef.current;
+    setRunningKeys([...controllers.current.keys()]);
+    setQueuedKeys((keys) => keys.filter((key) => key !== item.key));
+    markComplete(item.key, false);
     setAnalysis((m) => ({ ...m, [item.key]: "" }));
     setTools((m) => ({ ...m, [item.key]: [] }));
     let text = "";
     let toolList: string[] = [];
     try {
-      await chatStream([{ role: "user", content: item.prompt }], item.context, {
+      const prepared = item.prepareContext ? await item.prepareContext() : "";
+      if (!current()) return false;
+      const context = prepared.trim() ? `${item.context}\n\n调用前预取的客观数据：\n${prepared}` : item.context;
+      await chatStream([{ role: "user", content: item.prompt }], context, {
         onDelta: (t) => {
-          if (ac.signal.aborted) return;
+          if (!current()) return;
           text += t;
           setAnalysis((m) => ({ ...m, [item.key]: (m[item.key] || "") + t }));
         },
         onTool: (tool) => {
-          if (ac.signal.aborted) return;
+          if (!current()) return;
           const label = TOOL_LABEL[tool] || tool;
           if (!toolList.includes(label)) toolList = [...toolList, label];
           setTools((m) => ({ ...m, [item.key]: toolList }));
         },
       }, ac.signal);
-      if (ac.signal.aborted) return false;
-      if (!text.trim()) throw new Error("模型没有返回分析内容，请重试");
-      saveRecord(item.key, text, toolList);
-      completedRef.current = { ...completedRef.current, [item.key]: true };
-      setCompleted(completedRef.current);
+      if (!current()) return false;
+      if (!text.trim()) throw new Error("模型未返回分析正文，请重试");
+      saveRecord(item.key, text, toolList, item.name);
+      markComplete(item.key, true);
       return true;
     } catch (e) {
-      if (!ac.signal.aborted) {
-        setAiErr(e instanceof Error ? e.message : "分析失败");
-        setOpen(item.key);
-      }
+      if (current()) setErrors((m) => ({ ...m, [item.key]: e instanceof Error ? e.message : "分析失败" }));
       return false;
     } finally {
-      if (acRef.current === ac) setRunning(null);
+      if (generation === generationRef.current && controllers.current.get(item.key) === ac) {
+        controllers.current.delete(item.key);
+        setRunningKeys([...controllers.current.keys()]);
+      }
     }
   };
 
   const toggle = (item: DiveItem) => {
     if (open === item.key) {
-      if (running === item.key) acRef.current?.abort();
       setOpen(null);
       return;
     }
-    setAiErr(null);
     setNeedConfig(false);
-    if (completedRef.current[item.key]) {
-      setOpen(item.key); // 已有结果（本次会话或存档），展开即可
+    if (completedRef.current[item.key] || controllers.current.has(item.key) || batchRef.current) {
+      setOpen(item.key);
       return;
     }
-    if (batchActive.current) { setOpen(item.key); return; }
+    if (controllers.current.size) return;
+    setBatchSummary(null);
     void start(item, true);
   };
 
-  /** 一键全部分析：串行队列（兼容 CLI 订阅通道，不并发），跳过已分析的，可随时停止。 */
-  const runAll = async (items: DiveItem[]) => {
-    if (batchActive.current || running) return;
-    const todo = items.filter((it) => !completedRef.current[it.key]);
+  /** Bounded API workers; CLI requests stay serial. Only completed results are skipped. */
+  const runAll = async (items: DiveItem[], concurrency = 1) => {
+    if (batchRef.current || controllers.current.size || !day) return;
+    const todo = [...new Map(items.map((it) => [it.key, it])).values()].filter((it) => !completedRef.current[it.key]);
     if (todo.length === 0) return;
     if (!hasLlm()) {
       setNeedConfig(true);
       if (todo[0]) setOpen(todo[0].key);
       return;
     }
-    batchActive.current = true;
-    batchStopRef.current = false;
-    const generation = epoch.current;
-    let done = 0;
-    for (const it of todo) {
-      if (batchStopRef.current || generation !== epoch.current) break;
-      setBatch({ done, total: todo.length, current: it.key });
-      const ok = await start(it, false);
-      // 出错立即暂停，保留已成功的进度；重试不会跳过失败的半段文本。
-      if (!ok || generation !== epoch.current) break;
-      done += 1;
-      setBatch({ done, total: todo.length, current: "" });
-    }
-    if (generation === epoch.current) {
-      batchActive.current = false;
-      setBatch(null);
-    }
+    const provider = loadAgentConnection()?.provider;
+    const serial = !!provider && ["codex-private", "claude", "codebuddy"].includes(provider);
+    const limit = serial ? 1 : Math.max(1, Math.min(3, Math.floor(concurrency) || 1));
+    const generation = generationRef.current;
+    batchRef.current = true;
+    setBatchSummary(null);
+    setQueuedKeys(todo.map((it) => it.key));
+    let cursor = 0, done = 0, failed = 0;
+    const publish = () => setBatch({ done, total: todo.length, active: [...controllers.current.keys()], failed });
+    const worker = async () => {
+      while (generation === generationRef.current && cursor < todo.length) {
+        const item = todo[cursor++];
+        const task = start(item, false, generation);
+        publish();
+        const ok = await task;
+        if (generation !== generationRef.current) return;
+        done += 1;
+        if (!ok) failed += 1;
+        publish();
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, todo.length) }, worker));
+    if (generation !== generationRef.current) return;
+    batchRef.current = false;
+    setBatch(null); setQueuedKeys([]);
+    setBatchSummary(`分析完成：成功 ${done - failed} 只${failed ? `，失败 ${failed} 只` : ""}`);
   };
 
   const stopAll = () => {
-    epoch.current += 1;
-    batchActive.current = false;
-    batchStopRef.current = true;
-    acRef.current?.abort();
-    setBatch(null);
-    setRunning(null);
+    generationRef.current += 1;
+    const active = [...controllers.current.keys()];
+    for (const ac of controllers.current.values()) ac.abort();
+    controllers.current.clear();
+    batchRef.current = false;
+    setErrors((m) => ({ ...m, ...Object.fromEntries(active.map((key) => [key, "分析已停止，可重试"])) }));
+    setBatch(null); setRunningKeys([]); setQueuedKeys([]);
+    setBatchSummary("已停止，已完成的结果已保留");
   };
 
   return {
-    open, analysis, completed, tools, running, aiErr, needConfig, batch,
+    date: recordDate, names,
+    open, analysis, tools, running: runningKeys[0] || null, runningKeys, queuedKeys, completed, errors,
+    aiErr: open ? errors[open] || null : null, needConfig, batch, storageError, batchSummary,
+    busy: batch !== null || runningKeys.length > 0,
     toggle,
-    rerun: (item) => { if (!batchActive.current) void start(item, true); },
-    runAll: (items) => void runAll(items),
+    rerun: (item) => { if (!batchRef.current && !controllers.current.size) { setBatchSummary(null); void start(item, true); } },
+    runAll: (items, concurrency) => void runAll(items, concurrency),
     stopAll,
   };
 }
@@ -259,7 +306,7 @@ interface PanelProps {
 
 export function DeepDivePanel({ dd, stockKey, colSpan, noteTitle, onRerun }: PanelProps) {
   const text = dd.analysis[stockKey] || "";
-  const isRunning = dd.running === stockKey;
+  const isRunning = dd.runningKeys.includes(stockKey);
   return (
     <tr className="border-b border-border/30 bg-primary/[0.03]">
       <td colSpan={colSpan} className="px-3 py-3">
@@ -276,24 +323,23 @@ export function DeepDivePanel({ dd, stockKey, colSpan, noteTitle, onRerun }: Pan
                 <span key={t} className="rounded-full border border-secondary/40 bg-secondary/10 px-2 py-0.5">{t}</span>
               ))}
               {isRunning && <Loader2 className="h-3 w-3 animate-spin" />}
-              {!isRunning && text && dd.completed[stockKey] && (
+              {!isRunning && (text || dd.errors[stockKey]) && (
                 <>
                   <button
                     onClick={onRerun}
-                    className="inline-flex items-center gap-1 rounded border border-border/60 px-1.5 py-0.5 hover:text-foreground"
+                    disabled={dd.busy}
+                    className="inline-flex items-center gap-1 rounded border border-border/60 px-1.5 py-0.5 hover:text-foreground disabled:opacity-40"
                   >
                     <RefreshCw className="h-3 w-3" /> 重新分析
                   </button>
-                  <SaveNoteButton kind="问AI" title={noteTitle} content={text} />
+                  {dd.completed[stockKey] && <SaveNoteButton kind="问AI" title={noteTitle} content={text} />}
                 </>
               )}
             </div>
             {dd.aiErr && dd.open === stockKey && <p className="mb-1 text-xs text-danger">{dd.aiErr}</p>}
-            {!isRunning && text && !dd.completed[stockKey] && <p className="text-xs text-danger">本次分析未完整完成或未存档，不能作为已完成研究；可重新分析。</p>}
-            {dd.batch && !text && !isRunning && <p className="text-xs text-muted-foreground">批量分析排队中…</p>}
             <div className="prose prose-sm prose-invert max-w-none text-foreground">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {text || (isRunning ? (readMode() ? "正在分析，实际查询记录将显示在上方…" : "正在阅读已提供资料并整理回答…") : "")}
+                {text || (isRunning ? "正在调工具、组织分析…" : dd.queuedKeys.includes(stockKey) ? "等待分析" : "")}
               </ReactMarkdown>
             </div>
           </div>
@@ -308,34 +354,32 @@ interface RunAllProps {
   dd: DeepDiveState;
   items: DiveItem[];
   nameOf?: (key: string) => string; // 进度里显示名称（默认显示 key）
+  selectedItems?: DiveItem[];
+  /** 有“分析所选”时可隐藏全量入口，避免在同一处给出重复动作。 */
+  showAll?: boolean;
+  concurrency?: number;
 }
 
-export function RunAllButton({ dd, items, nameOf }: RunAllProps) {
+export function RunAllButton({ dd, items, nameOf, selectedItems, showAll = true, concurrency = 1 }: RunAllProps) {
   const remaining = items.filter((it) => !dd.completed[it.key]).length;
-  if (!items.length) return null;
-  if (dd.batch) {
-    return (
-      <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+  const selectedRemaining = selectedItems?.filter((it) => !dd.completed[it.key]).length || 0;
+  const buttonClass = "inline-flex min-h-8 items-center gap-1 rounded border border-primary/50 bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary hover:bg-primary/20 disabled:cursor-not-allowed disabled:opacity-40";
+  return <span className="inline-flex max-w-full flex-wrap items-center gap-2 text-xs font-normal text-muted-foreground">
+    {dd.busy ? <>
         <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-        批量分析中 {dd.batch.done}/{dd.batch.total}
-        {dd.batch.current && <>· {nameOf ? nameOf(dd.batch.current) : dd.batch.current}</>}
-        <button
-          onClick={dd.stopAll}
-          className="rounded border border-border/60 px-1.5 py-0.5 hover:text-foreground"
-        >
-          停止
-        </button>
-      </span>
-    );
-  }
-  return (
-    <button
-      onClick={() => dd.runAll(items)}
-      disabled={remaining === 0 || !!dd.running}
-      className="inline-flex items-center gap-1 rounded-lg border border-primary/50 bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/20 disabled:cursor-not-allowed disabled:opacity-40"
-    >
-      <Sparkles className="h-3 w-3" />
-      {remaining === 0 ? "已全部分析" : `一键全部分析（剩 ${remaining} 只）`}
-    </button>
-  );
+        <span role="status">{dd.batch ? `批量分析中 ${dd.batch.done}/${dd.batch.total}${dd.batch.failed ? `，失败 ${dd.batch.failed} 只` : ""}` : "分析中"}</span>
+        <span className="break-words">{dd.runningKeys.map((key) => nameOf ? nameOf(key) : key).join("、")}</span>
+        <button type="button" onClick={dd.stopAll} title="停止分析" aria-label="停止分析"
+          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-border hover:text-foreground"><Square className="h-3.5 w-3.5" /></button>
+    </> : <>
+      {selectedItems && <button type="button" onClick={() => dd.runAll(selectedItems, concurrency)} disabled={!selectedRemaining} className={buttonClass}>
+        <Sparkles className="h-3 w-3" />分析所选（{selectedRemaining} 只）
+      </button>}
+      {showAll && <button type="button" onClick={() => dd.runAll(items, concurrency)} disabled={!remaining} className={buttonClass}>
+        <Sparkles className="h-3 w-3" />{remaining === 0 ? "已全部分析" : `一键全部分析（剩 ${remaining} 只）`}
+      </button>}
+      {dd.batchSummary && <span role="status">{dd.batchSummary}</span>}
+    </>}
+    {dd.storageError && <span role="alert" className="w-full text-warning">{dd.storageError}</span>}
+  </span>;
 }

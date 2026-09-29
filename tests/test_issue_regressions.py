@@ -7,6 +7,31 @@ from pathlib import Path
 import pytest
 
 
+def test_strict_limit_pool_distinguishes_zero_from_source_failure(monkeypatch):
+    from types import SimpleNamespace
+    from vr import astock
+
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {"rc": 0, "data": {"qdate": "2026-09-25", "tc": 0, "pool": []}},
+    )
+    monkeypatch.setattr(astock, "em_get", lambda *args, **kwargs: response)
+    observed = astock.em_zt_topic_observed("getTopicZTPool", "20260925")
+    assert observed["available"] is True and observed["rows"] == []
+
+    response.json = lambda: {"rc": 0, "data": {"qdate": "2026-09-24", "tc": 0, "pool": []}}
+    observed = astock.em_zt_topic_observed("getTopicZTPool", "20260925")
+    assert observed["available"] is False and observed["rows"] is None
+
+
+def test_beijing_exchange_prefixes_are_not_sent_to_shenzhen():
+    from vr import astock
+
+    assert astock.get_prefix("430001") == "bj"
+    assert astock.get_prefix("830001") == "bj"
+    assert astock.get_prefix("920001") == "bj"
+
+
 def test_custom_business_root_reaches_all_writers(tmp_path):
     root = tmp_path / 'D 盘资料'
     env = {**os.environ, 'ASTOCK_DATA_HOME': str(root)}

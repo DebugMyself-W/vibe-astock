@@ -81,6 +81,33 @@ def test_partial_primary_is_filled_without_overwriting_primary(isolated_gateway,
 
 
 @pytest.mark.unit
+def test_iwencai_query_is_date_bound_and_reads_the_matching_reason_column(isolated_gateway, monkeypatch):
+    from duanxian import fetchers
+    import pandas as pd
+
+    captured: list[str] = []
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self._session = type("Session", (), {"close": staticmethod(lambda: None)})()
+
+        def query(self, query, page=1, limit=50):
+            captured.append(query)
+            return pd.DataFrame({
+                "股票代码": ["600001.SH"],
+                "涨停原因[20260902]": ["错误场次"],
+                "涨停原因[20260901]": ["机器人+国企改革"],
+            })
+
+    monkeypatch.setattr(fetchers, "_iwencai_client_cls", lambda: Client)
+    reasons, error = isolated_gateway._fetch_iwencai("2026-09-01")
+
+    assert captured and "2026-09-01" in captured[0] and "今日" not in captured[0]
+    assert reasons == {"600001": "机器人+国企改革"}
+    assert error is None
+
+
+@pytest.mark.unit
 def test_breaker_skips_primary_across_callers(isolated_gateway, monkeypatch):
     source = isolated_gateway
     source._set_breaker("rate_limited", 15, None, "暂停 15 分钟")
@@ -120,9 +147,32 @@ def test_setting_round_trip_is_atomic(tmp_path, monkeypatch, value):
     assert app_settings.get_settings()["iwencai_intraday_refresh_minutes"] == value
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["auto", "direct", "proxy"])
+def test_market_network_setting_round_trip(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(app_settings, "_PATH", str(tmp_path / "settings.json"))
+    saved = app_settings.update_settings(
+        60, market_network={"mode": mode, "proxy_url": "http://172.20.32.1:7890"},
+    )
+    assert saved["market_network"] == {"mode": mode, "proxy_url": "http://172.20.32.1:7890"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("proxy_url", [
+    "socks5://172.20.32.1:7890",
+    "http://user:secret@172.20.32.1:7890",
+    "http://172.20.32.1:7890/path",
+    "not-a-url",
+])
+def test_market_network_rejects_unsafe_proxy_urls(tmp_path, monkeypatch, proxy_url):
+    monkeypatch.setattr(app_settings, "_PATH", str(tmp_path / "settings.json"))
+    with pytest.raises(ValueError, match="代理地址"):
+        app_settings.update_settings(60, market_network={"mode": "proxy", "proxy_url": proxy_url})
+
+
 def test_scheduled_review_failure_is_persisted_for_settings_ui(tmp_path, monkeypatch):
     monkeypatch.setattr(app_settings, "_PATH", str(tmp_path / "settings.json"))
-    app_settings.update_settings(60, {"enabled": True, "time": "18:30"})
+    app_settings.update_settings(60, {"enabled": True, "time": "18:30", "source": {"provider": "codex-private", "model": "gpt-test"}})
     app_settings.mark_review_schedule_run("2026-09-17", "2026-09-17 18:30:02 CST")
     app_settings.mark_review_schedule_result(
         "2026-09-17", "failed", "2026-09-17 18:56:46 CST", 1604,
@@ -133,3 +183,9 @@ def test_scheduled_review_failure_is_persisted_for_settings_ui(tmp_path, monkeyp
     assert schedule["last_status"] == "failed"
     assert schedule["last_elapsed"] == 1604
     assert schedule["last_error"] == "RuntimeError: codex 生成超时"
+
+
+def test_scheduled_review_rejects_browser_only_api_credentials(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_settings, "_PATH", str(tmp_path / "settings.json"))
+    with pytest.raises(ValueError, match="仅支持已测试"):
+        app_settings.update_settings(60, {"enabled": True, "time": "18:30", "source": {"provider": "openai", "model": "gpt-test"}})

@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
+from net_utils import market_urlopen
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCES_FILE = os.path.join(HERE, "news_sources.json")
 CACHE_DIR = os.path.join(os.environ["VR_DATA_DIR"], "cache") if os.environ.get("VR_DATA_DIR") else os.path.expanduser("~/.vibe-astock-agent/market-data/cache")
@@ -60,7 +62,7 @@ def _fetch_source(src: dict, per: int, cutoff, redline: list[str]):
             "User-Agent": UA,
             "Accept": "application/rss+xml,application/atom+xml,application/xml,text/xml,*/*",
         })
-        with urllib.request.urlopen(req, timeout=14) as r:
+        with market_urlopen(req, timeout=14) as r:
             raw = r.read()
         root = ET.fromstring(raw)
         out = []

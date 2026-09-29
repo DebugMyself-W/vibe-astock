@@ -11,25 +11,29 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
 import re
 import time
 import threading
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from net_utils import market_session, market_urlopen
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 
 def get_prefix(code: str) -> str:
     """6 位代码 → 交易所前缀。5 开头是沪市基金/ETF（51/56/58 等），深市基金 15/16 开头走默认 sz。"""
+    if code.startswith(("4", "8", "920")):
+        return "bj"
     if code.startswith(("6", "9", "5")):
         return "sh"
-    if code.startswith("8"):
-        return "bj"
     return "sz"
 
 
@@ -44,7 +48,7 @@ class DependencyMissing(RuntimeError):
 def _fetch_gtimg(prefixed_codes: list[str]) -> str:
     url = "https://qt.gtimg.cn/q=" + ",".join(prefixed_codes)
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with market_urlopen(req, timeout=10) as resp:
         return resp.read().decode("gbk")
 
 
@@ -96,6 +100,56 @@ def tencent_quote(codes: list[str]) -> dict[str, dict]:
     return _parse_gtimg(_fetch_gtimg(prefixed))
 
 
+def tencent_quote_observed(codes: list[str]) -> dict[str, dict]:
+    """严格读取集合竞价公开盘口；缺失值保持缺失，不据此推测。"""
+    result = {}
+    codes = list(dict.fromkeys(code for code in codes if re.fullmatch(r"\d{6}", code)))
+    for start in range(0, len(codes), 50):
+        try:
+            raw = _fetch_gtimg([get_prefix(code) + code for code in codes[start:start + 50]])
+        except Exception:
+            continue
+        for line in raw.split(";"):
+            if '"' not in line or "=" not in line:
+                continue
+            values = line.split('"')[1].split("~")
+            if len(values) <= 32:
+                continue
+            code = line.split("=")[0].strip()[-6:]
+            if code not in codes:
+                continue
+            try:
+                timestamp = datetime.strptime(values[30], "%Y%m%d%H%M%S").isoformat() + "+08:00"
+                price, pct = float(values[3]), float(values[32])
+                if price <= 0 or not math.isfinite(price) or not math.isfinite(pct):
+                    continue
+            except (ValueError, IndexError):
+                continue
+
+            def observed_number(index: int) -> float | None:
+                try:
+                    value = float(values[index])
+                    return value if math.isfinite(value) and value >= 0 else None
+                except (ValueError, IndexError):
+                    return None
+
+            matched_hands = observed_number(6)
+            bid1_hands, ask1_hands = observed_number(10), observed_number(20)
+            bid1_volume = bid1_hands * 100 if bid1_hands is not None else None
+            ask1_volume = ask1_hands * 100 if ask1_hands is not None else None
+            queue_total = (bid1_volume or 0) + (ask1_volume or 0)
+            result[code] = {
+                "price": price, "pct": pct, "last_close": observed_number(4),
+                "quote_time": timestamp, "name": values[1],
+                "matched_volume": matched_hands * 100 if matched_hands is not None else None,
+                "matched_amount": matched_hands * 100 * price if matched_hands is not None else None,
+                "bid1_volume": bid1_volume, "ask1_volume": ask1_volume,
+                "dominant_queue_volume": max(bid1_volume or 0, ask1_volume or 0) if queue_total else None,
+                "order_imbalance": round(((bid1_volume or 0) - (ask1_volume or 0)) / queue_total, 4) if queue_total else None,
+            }
+    return result
+
+
 # A股大盘指数（前缀规则与个股不同，固定带前缀代码）
 A_INDICES = ["sh000001", "sz399001", "sz399006", "sh000300"]
 
@@ -120,9 +174,7 @@ _PDF_TPL = "https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf"
 
 
 def _report_session():
-    import requests  # 轻依赖，随后端一起装
-
-    s = requests.Session()
+    s = market_session()
     s.headers.update({"User-Agent": UA, "Referer": "https://data.eastmoney.com/"})
     return s
 
@@ -249,14 +301,13 @@ def disclosure(code: str) -> list[dict]:
 
 def announcements(code: str, limit: int = 15) -> list[dict]:
     """个股近期公告（东财公开接口，仅 requests，稳定）。返回 日期/标题/类型/详情链接。"""
-    import requests
-
-    r = requests.get(
-        "https://np-anotice-stock.eastmoney.com/api/security/ann",
-        params={"sr": -1, "page_size": limit, "page_index": 1, "ann_type": "A",
-                "client_source": "web", "stock_list": code, "f_node": 0, "s_node": 0},
-        headers={"User-Agent": UA}, timeout=20,
-    )
+    with market_session() as session:
+        r = session.get(
+            "https://np-anotice-stock.eastmoney.com/api/security/ann",
+            params={"sr": -1, "page_size": limit, "page_index": 1, "ann_type": "A",
+                    "client_source": "web", "stock_list": code, "f_node": 0, "s_node": 0},
+            headers={"User-Agent": UA}, timeout=20,
+        )
     lst = (r.json().get("data") or {}).get("list") or []
     out = []
     for a in lst:
@@ -283,11 +334,126 @@ def _mootdx_client():
         raise DependencyMissing("mootdx 未安装：pip install mootdx") from e
 
 
+def _tencent_daily_kline(code: str, offset: int = 60, *, adjusted: bool = True) -> list[dict]:
+    """腾讯日 K；通用 K 线回退用前复权，涨停计算用未复权。"""
+    symbol = f"{get_prefix(code)}{code}"
+    suffix = ",qfq" if adjusted else ""
+    query = urllib.parse.urlencode({"param": f"{symbol},day,,,{offset}{suffix}"})
+    request = urllib.request.Request(
+        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{query}",
+        headers={"User-Agent": UA, "Referer": "https://gu.qq.com/"},
+    )
+    with market_urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    node = (payload.get("data") or {}).get(symbol) or {}
+    rows = (node.get("qfqday") if adjusted else (node.get("day") or node.get("qfqday"))) or []
+    result = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        try:
+            result.append({
+                "datetime": row[0], "open": float(row[1]), "close": float(row[2]),
+                "high": float(row[3]), "low": float(row[4]), "vol": float(row[5]),
+                "amount": float(row[6]) if len(row) > 6 and row[6] not in (None, "") else None,
+            })
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 def kline(code: str, category: int = 4, offset: int = 60) -> list[dict]:
-    """K线：category 4=日 5=周 6=月 11=60分钟。"""
-    client = _mootdx_client()
-    df = client.bars(symbol=code, category=category, offset=offset)
-    return df.to_dict("records") if df is not None and not df.empty else []
+    """K线：mootdx 优先；日线缺失时降级到腾讯前复权数据。"""
+    try:
+        client = _mootdx_client()
+        df = client.bars(symbol=code, frequency=category, offset=offset)
+        rows = df.to_dict("records") if df is not None and not df.empty else []
+        if rows:
+            return rows
+    except Exception:
+        pass
+    return _tencent_daily_kline(code, offset) if category in (4, 9) else []
+
+
+def raw_daily_kline(code: str, offset: int = 260) -> list[dict]:
+    """未复权腾讯日 K，用于涨停价与涨停基因计算。"""
+    return _tencent_daily_kline(code, offset, adjusted=False)
+
+
+def _akshare_tencent_daily_kline(code: str, offset: int = 260) -> list[dict]:
+    import akshare as ak
+
+    symbol = f"{get_prefix(code)}{code}"
+    end = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=max(420, offset * 2))).strftime("%Y%m%d")
+    frame = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start, end_date=end)
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    result = []
+    for row in frame.to_dict("records"):
+        try:
+            result.append({
+                "datetime": str(row["date"]), "open": float(row["open"]),
+                "close": float(row["close"]), "high": float(row["high"]),
+                "low": float(row["low"]), "vol": float(row.get("volume") or 0),
+                "amount": float(row["amount"]) if row.get("amount") is not None else None,
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result[-offset:]
+
+
+def _eastmoney_daily_kline(code: str, offset: int = 260) -> list[dict]:
+    code = str(code).strip()
+    market = "1" if code.startswith(("5", "6", "9")) else "0"
+    response = em_get(
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+        params={
+            "secid": f"{market}.{code}", "klt": "101", "fqt": "0", "lmt": str(offset),
+            "end": "20500101", "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        },
+        headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}, timeout=12,
+    )
+    response.raise_for_status()
+    rows = ((response.json().get("data") or {}).get("klines") or [])
+    result = []
+    for row in rows:
+        columns = row.split(",") if isinstance(row, str) else []
+        if len(columns) < 6:
+            continue
+        try:
+            result.append({
+                "datetime": columns[0], "open": float(columns[1]), "close": float(columns[2]),
+                "high": float(columns[3]), "low": float(columns[4]), "vol": float(columns[5]),
+                "amount": float(columns[6]) if len(columns) > 6 and columns[6] else None,
+            })
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def limit_gene_daily_kline(code: str, offset: int = 260) -> tuple[list[dict], str]:
+    """涨停基因日 K：腾讯未复权优先，并保留两个可追溯回退源。"""
+    try:
+        rows = raw_daily_kline(code, offset)
+    except Exception:
+        rows = []
+    if len(rows) >= 20:
+        return rows, "腾讯日K（未复权）"
+    try:
+        tencent_rows = _akshare_tencent_daily_kline(code, offset)
+    except Exception:
+        tencent_rows = []
+    if len(tencent_rows) >= 20:
+        return tencent_rows, "腾讯历史日K（AkShare 客户端）"
+    try:
+        fallback = _eastmoney_daily_kline(code, offset)
+    except Exception:
+        fallback = []
+    if len(fallback) >= 20:
+        return fallback, "东财历史日K（腾讯日K不可用时回退）"
+    return rows or tencent_rows or fallback, "腾讯日K与东财历史日K"
 
 
 def finance(code: str) -> dict:
@@ -459,71 +625,19 @@ def full_valuation(code: str) -> dict:
 _DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 _EM_MIN_INTERVAL = 1.0          # 两次东财请求最小间隔（秒），内置防封节流
 _em_last_call = [0.0]
-_EM_SESSIONS: dict = {}         # {direct(bool): requests.Session}
-
-# 数据层连接模式：国内财经站（东财/腾讯/新浪）本应「直连」——很多用户开着 Clash/V2Ray
-# 科学上网，系统代理会把东财这类国内站路由挂掉（典型：push2.eastmoney.com 的 CONNECT 被掐）。
-# 默认 auto：先试直连、失败再降级走系统代理；探测一次后固定，避免每次都重试。
-# 只有少数「必须靠代理才能出网」的环境需要 VR_DATA_PROXY=1 强制走代理。
-# 注意：这只影响数据层；AI 层（可能要调国外模型）仍走各自的系统代理，不受影响。
-_em_mode = ["proxy" if os.environ.get("VR_DATA_PROXY", "").strip().lower() in ("1", "true", "yes") else "auto"]
-
-
-def _em_session(direct: bool):
-    """东财专用会话。direct=True → `trust_env=False` 忽略 HTTP(S)_PROXY 环境变量、直连。
-
-    直连会话不重试（探测要快，失败即降级）；代理会话保留瞬态错误退避重试。惰性构建、复用。
-    """
-    if direct in _EM_SESSIONS:
-        return _EM_SESSIONS[direct]
-    import requests
-
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA})
-    s.trust_env = not direct     # 直连会话不读环境里的代理配置
-    try:
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-
-        retry = Retry(total=0) if direct else Retry(
-            total=3, connect=3, backoff_factor=0.6,
-            status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
-        adapter = HTTPAdapter(max_retries=retry)
-        s.mount("https://", adapter)
-        s.mount("http://", adapter)
-    except Exception:
-        pass  # 老版本 urllib3 缺参数时降级为无重试
-    _EM_SESSIONS[direct] = s
-    return s
-
-
 _EM_REQUEST_LOCK = threading.Lock()
 
 def em_get(url: str, params: dict | None = None, headers: dict | None = None, timeout: int = 15):
-    """东财请求按启动时刻限流；慢请求不阻塞其他页面的网络往返。"""
+    """东财请求限流；网络路径由统一市场数据策略决定。"""
     with _EM_REQUEST_LOCK:
         now = time.monotonic()
         start = max(now, _em_last_call[0])
         _em_last_call[0] = start + _EM_MIN_INTERVAL + random.uniform(0.1, 0.5)
-        # Session creation and routing state are brief, local operations.
-        mode = _em_mode[0]
-        direct = _em_session(True) if mode != "proxy" else None
-        proxy = _em_session(False) if mode != "direct" else None
     wait = start - time.monotonic()
     if wait > 0:
         time.sleep(wait)
-    if mode != "auto":
-        return (direct if mode == "direct" else proxy).get(url, params=params, headers=headers, timeout=timeout)
-    try:
-        result = direct.get(url, params=params, headers=headers, timeout=min(timeout, 8))
-        selected = "direct"
-    except Exception:
-        result = proxy.get(url, params=params, headers=headers, timeout=timeout)
-        selected = "proxy"
-    with _EM_REQUEST_LOCK:
-        if _em_mode[0] == "auto":
-            _em_mode[0] = selected
-    return result
+    with market_session() as session:
+        return session.get(url, params=params, headers=headers, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -533,21 +647,61 @@ def em_get(url: str, params: dict | None = None, headers: dict | None = None, ti
 # ---------------------------------------------------------------------------
 _ZTB_UT = "7eea3edcaed734bea9cbfc24409ed989"
 
+_ZT_TOPIC_SORT = {
+    "getTopicZTPool": "fbt:asc",
+    "getTopicZBPool": "fbt:asc",
+    "getTopicDTPool": "fund:asc",
+    "getYesterdayZTPool": "zs:desc",
+}
 
-def em_zt_topic_pool(endpoint: str, date: str, sort: str = "fbt:asc") -> list[dict]:
+
+def _zt_topic_sort(endpoint: str, sort: str | None) -> str:
+    return sort or _ZT_TOPIC_SORT.get(endpoint, "fbt:asc")
+
+
+def em_zt_topic_pool(endpoint: str, date: str, sort: str | None = None) -> list[dict]:
     """东财涨停板行情中心原始池（push2ex）。
     endpoint: getTopicZTPool(涨停) / getTopicZBPool(炸板) / getTopicDTPool(跌停) / getYesterdayZTPool(昨涨停)
     date: YYYYMMDD 交易日。非交易日 / 参数错 → []。
     池内每项字段含 lbc(连板数) / zbc(炸板次数) / hybk(行业) 等。"""
     url = f"https://push2ex.eastmoney.com/{endpoint}"
     params = {"ut": _ZTB_UT, "dpt": "wz.ztzt", "Pageindex": 0,
-              "pagesize": 10000, "sort": sort, "date": date}
+              "pagesize": 10000, "sort": _zt_topic_sort(endpoint, sort), "date": date}
     headers = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
     try:
         r = em_get(url, params=params, headers=headers, timeout=10)
         return (r.json().get("data") or {}).get("pool") or []
     except Exception:
         return []
+
+
+def em_zt_topic_observed(endpoint: str, date: str, sort: str | None = None) -> dict:
+    """严格区分数据源失败与真实零家，供复盘与首板等事实消费者使用。"""
+    params = {"ut": _ZTB_UT, "dpt": "wz.ztzt", "Pageindex": 0,
+              "pagesize": 10000, "sort": _zt_topic_sort(endpoint, sort), "date": date}
+    try:
+        response = em_get(
+            f"https://push2ex.eastmoney.com/{endpoint}", params=params,
+            headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}, timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data")
+        if payload.get("rc", 0) != 0 or not isinstance(data, dict) or not isinstance(data.get("pool"), list):
+            raise ValueError("数据源没有返回有效池（不能视为零家）")
+        source_date = str(data.get("qdate") or date).replace("-", "")
+        if source_date != date:
+            raise ValueError("池数据所属日期不符")
+        rows = data["pool"]
+        if data.get("tc") is not None and int(data["tc"]) != len(rows):
+            raise ValueError("池数据未完整返回")
+        if any(not re.fullmatch(r"\d{6}", str(row.get("c", ""))) for row in rows):
+            raise ValueError("池成员代码格式错误")
+        return {"available": True, "rows": rows, "date": date,
+                "source_date": data.get("qdate"), "reason": ""}
+    except Exception as exc:
+        return {"available": False, "rows": None, "date": date,
+                "reason": f"{type(exc).__name__}: {exc}"}
 
 
 def _numf(v):
@@ -825,9 +979,18 @@ def concept_blocks(code: str) -> dict:
     params = {"fltt": "2", "invt": "2", "secid": f"{market_code}.{code}",
               "spt": "3", "pi": "0", "pz": "200", "po": "1", "fields": "f12,f14,f3,f128"}
     headers = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
-    try:
-        d = em_get("https://push2.eastmoney.com/api/qt/slist/get", params=params, headers=headers, timeout=15).json()
-    except Exception:
+    d = None
+    # 同一 slist 算法只切换东财官方镜像。住宅 IP/Clash 对 push2 偶发 reset
+    # 时，不能把一次连接失败伪装成“该股没有概念”。
+    for host in ("push2.eastmoney.com", "push2test.eastmoney.com", "push2delay.eastmoney.com"):
+        try:
+            candidate = em_get(f"https://{host}/api/qt/slist/get", params=params, headers=headers, timeout=15).json()
+            if ((candidate.get("data") or {}).get("diff")):
+                d = candidate
+                break
+        except Exception:
+            continue
+    if d is None:
         return {"total": 0, "boards": [], "concept_tags": []}
     diff = (d.get("data") or {}).get("diff") or {}
     items = diff.values() if isinstance(diff, dict) else diff
@@ -838,14 +1001,13 @@ def concept_blocks(code: str) -> dict:
 
 def hot_concepts(code: str) -> list[dict]:
     """个股当下被市场归到哪些概念在炒（东财热门概念命中，按热度降序）。"""
-    import requests
-
     try:
         prefix = "SH" if code.startswith("6") else "SZ"
-        r = requests.post(
-            "https://emappdata.eastmoney.com/stockrank/getHotStockRankList",
-            json={"appId": "appId01", "globalId": "786e4c21-70dc-435a-93bb-38", "srcSecurityCode": prefix + code},
-            headers={"User-Agent": UA}, timeout=10)
+        with market_session() as session:
+            r = session.post(
+                "https://emappdata.eastmoney.com/stockrank/getHotStockRankList",
+                json={"appId": "appId01", "globalId": "786e4c21-70dc-435a-93bb-38", "srcSecurityCode": prefix + code},
+                headers={"User-Agent": UA}, timeout=10)
         data = r.json().get("data") or []
     except Exception:
         return []
@@ -854,19 +1016,18 @@ def hot_concepts(code: str) -> list[dict]:
 
 def investor_qa(code: str, page_size: int = 30) -> list[dict]:
     """互动易问答（巨潮）：投资者提问 + 公司回复（answer=None 表示未回复）。"""
-    import requests
-
     try:
-        r1 = requests.post("https://irm.cninfo.com.cn/newircs/index/queryKeyboardInfo",
-                           data={"keyWord": code}, headers={"User-Agent": UA}, timeout=10)
-        d1 = r1.json().get("data") or []
-        if not d1:
-            return []
-        org_id = d1[0].get("secid")
-        params = {"_t": 1, "stockcode": code, "orgId": org_id, "pageSize": page_size,
-                  "pageNum": 1, "keyWord": "", "startDay": "", "endDay": ""}
-        rows = requests.post("https://irm.cninfo.com.cn/newircs/company/question",
-                             params=params, headers={"User-Agent": UA}, timeout=10).json().get("rows") or []
+        with market_session() as session:
+            r1 = session.post("https://irm.cninfo.com.cn/newircs/index/queryKeyboardInfo",
+                              data={"keyWord": code}, headers={"User-Agent": UA}, timeout=10)
+            d1 = r1.json().get("data") or []
+            if not d1:
+                return []
+            org_id = d1[0].get("secid")
+            params = {"_t": 1, "stockcode": code, "orgId": org_id, "pageSize": page_size,
+                      "pageNum": 1, "keyWord": "", "startDay": "", "endDay": ""}
+            rows = session.post("https://irm.cninfo.com.cn/newircs/company/question",
+                                params=params, headers={"User-Agent": UA}, timeout=10).json().get("rows") or []
     except Exception:
         return []
     out = []

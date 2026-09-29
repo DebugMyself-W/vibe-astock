@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { CalendarRange, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Caliber } from "@/components/ui/Caliber";
+import { StockLink } from "@/components/ui/StockLink";
 import { agentFetch, finite, pct, safeArray, type WeeklyData, type LineageLeader } from "@/lib/agent";
 
 function Sparkline({ leader }: { leader: LineageLeader }) {
@@ -97,7 +98,7 @@ export function AgentWeekly() {
                   </span>
                   <span className="text-center font-extrabold text-primary">{d.highest_consec ?? "—"}板</span>
                   <span>{d.broken_rate != null ? Math.round(d.broken_rate * 100) + "%" : "—"}</span>
-                  <span className="text-[13px]">{d.leaders?.length ? d.leaders.map(l => `${l.name} ${l.boards}板 · ${l.sector || ""}`).join("；") : d.leader ? `${d.leader.name}（旧版仅记录一只）` : "—"}</span>
+                  <span className="text-[13px]">{d.leaders?.length ? d.leaders.map((l, i) => <span key={l.code}>{i > 0 && "；"}<StockLink code={l.code}>{l.name}</StockLink> {l.boards}板 · {l.sector || ""}</span>) : d.leader ? <><StockLink code={d.leader.code}>{d.leader.name}</StockLink>（旧版仅记录一只）</> : "—"}</span>
                 </div>
               ))}
             </div>
@@ -126,8 +127,8 @@ export function AgentWeekly() {
                     dd == null ? "border-l-border" : atPeak ? "border-l-success" : "border-l-danger")}>
                     <div className="flex items-baseline justify-between gap-2">
                       <span className="flex items-baseline gap-1.5 text-[15px] font-bold">
-                        {l.name}
-                        <span className="text-xs font-normal text-muted-foreground">{l.code}</span>
+                        <StockLink code={l.code}>{l.name}</StockLink>
+                        <StockLink code={l.code} className="text-xs font-normal text-muted-foreground">{l.code}</StockLink>
                         {/* 只标一个「当前最高标」，不写板数。
                             后端按**最近一个交易日**的最高标判定，不是按板数最大 —— 前几天的
                             高标早断板了也照样板数最大，那样会把已经不在场的票标成"当前"。 */}

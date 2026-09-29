@@ -19,6 +19,7 @@ from typing import Any, Iterable, Literal
 
 import pandas as pd
 import requests
+from net_utils import market_session
 
 logger = logging.getLogger("iwencai")
 
@@ -107,7 +108,7 @@ class IwencaiClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self._session = requests.Session()
+        self._session = market_session()
         self._session.headers.update(
             {
                 "Authorization": f"Bearer {self.api_key}",

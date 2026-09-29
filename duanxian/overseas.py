@@ -17,6 +17,8 @@ from __future__ import annotations
 import urllib.request
 from typing import Optional
 
+from net_utils import market_urlopen
+
 _TENCENT = "https://qt.gtimg.cn/q="
 _F_NAME, _F_PRICE, _F_TIME, _F_PCT = 1, 3, 30, 32
 
@@ -63,7 +65,7 @@ def _fetch(symbols: list[str]) -> dict[str, list[str]]:
     try:
         req = urllib.request.Request(_TENCENT + ",".join(symbols),
                                      headers={"User-Agent": "Mozilla/5.0"})
-        raw = urllib.request.urlopen(req, timeout=12).read().decode("gbk", "ignore")
+        raw = market_urlopen(req, timeout=12).read().decode("gbk", "ignore")
     except Exception:  # noqa: BLE001  取不到就整块标不可用，不给半份数据
         return {}
     out: dict[str, list[str]] = {}

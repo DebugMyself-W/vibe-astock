@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.routing import APIRoute
@@ -321,9 +321,21 @@ def create_router(manager_source: Manager | Callable[[], Manager], access_key: s
     def deepdive_cancel(body: DailyCancelInput, manager: Manager = Depends(get_manager)):
         return checked(manager.deepdive.cancel, body.job_id)
 
+    @router.get("/deepdive/reports")
+    def deepdive_reports(
+        limit: int = Query(50, ge=1, le=200),
+        code: str = Query("", pattern=r"^$|^\d{6}$"),
+        manager: Manager = Depends(get_manager),
+    ):
+        return checked(manager.deepdive.list_reports, limit, code)
+
     @router.get("/deepdive/reports/{job_id}")
     def deepdive_report(job_id: str, manager: Manager = Depends(get_manager)):
         return checked(manager.deepdive.report, job_id)
+
+    @router.post("/deepdive/reports/{job_id}/delete")
+    def deepdive_delete_report(job_id: str, manager: Manager = Depends(get_manager)):
+        return checked(manager.deepdive.delete_report, job_id)
 
     @router.post("/chat-jobs")
     def page_chat_submit(body: PageChatInput, manager: Manager = Depends(get_manager)):

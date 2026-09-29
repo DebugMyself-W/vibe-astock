@@ -41,6 +41,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Optional
 
+from net_utils import market_urlopen
 from sources._http import record_raw
 
 KALSHI_EVENTS = "https://api.elections.kalshi.com/trade-api/v2/events"
@@ -170,7 +171,7 @@ def _get(url: str, params: dict, timeout: int = 25) -> bytes:
     req = urllib.request.Request(q, headers={"User-Agent": UA, "Accept": "application/json"})
     # read1 does at most one buffered read: a slow trickle cannot keep one read()
     # alive indefinitely without giving us a chance to check the budget again.
-    with urllib.request.urlopen(req, timeout=min(float(timeout), 10.0, remaining())) as response:
+    with market_urlopen(req, timeout=min(float(timeout), 10.0, remaining())) as response:
         chunks = []
         while True:
             remaining()

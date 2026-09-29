@@ -1,16 +1,21 @@
-import { useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import {
   AlertTriangle, ArrowLeftRight, ChevronDown, ChevronRight, Gauge, Layers3,
-  ListTree, Lock, Network, Rows3,
+  ListTree, Lock, Network, Rows3, Download, Loader2, Sparkles, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Caliber } from "@/components/ui/Caliber";
+import { StockLink } from "@/components/ui/StockLink";
+import { StockTrafficBadge } from "@/components/BoardTrafficLight";
+import { DeepDivePanel, useDeepDive, type DiveItem } from "@/components/ui/DeepDive";
 import { pctColor, countColor, strengthColor } from "@/lib/colors";
 import { finite, safeArray, safeRecord } from "@/lib/agent";
+import { api } from "@/lib/api";
+import { formatDragonTigerContext } from "@/lib/dragon-tiger";
 import type {
   BoardStat, ByBoard, EventLedger, FeedbackCell, FeedbackMatrix,
   DayChange, DayDiff, FeedbackDetail, LossEffect, SealQuality,
-  StatItem, StatsContext, ThemeNode, ThemeStructure, ThemeTree,
+  IwencaiStatus, StatItem, StatsContext, ThemeNode, ThemeStructure, ThemeTree,
 } from "@/lib/agent";
 
 function rate(v?: number | null): string {
@@ -42,10 +47,10 @@ function ratioOf(count?: number | null, sample?: number | null): number | null {
 }
 
 export function Section({
-  icon: Icon, title, hint, caliber, available, reason, children,
+  icon: Icon, title, hint, caliber, available, reason, action, children,
 }: {
   icon: typeof Gauge; title: string; hint?: string; caliber?: string;
-  available?: boolean; reason?: string; children: React.ReactNode;
+  available?: boolean; reason?: string; action?: React.ReactNode; children: React.ReactNode;
 }) {
   return (
     <div className="glass rounded-2xl p-5">
@@ -53,6 +58,7 @@ export function Section({
         <Icon className="h-4 w-4 text-primary" />
         <h3 className="text-sm font-bold">{title}</h3>
         {caliber && <Caliber text={caliber} />}
+        {action && <div className="ml-auto flex flex-wrap items-center justify-end gap-2">{action}</div>}
       </div>
       {hint && <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">{hint}</p>}
       {available === false
@@ -63,14 +69,125 @@ export function Section({
 }
 
 /** 昨日强势股反馈矩阵：按昨日板位分组，看今天各落到什么结果 */
-export function Matrix({ fm }: { fm?: FeedbackMatrix }) {
+export function Matrix({ fm, date = "" }: { fm?: FeedbackMatrix; date?: string }) {
   const matrix = safeRecord<FeedbackCell>(fm?.matrix);
+  const details = safeArray<FeedbackDetail>(fm?.details);
+  const analysisDate = date || fm?.prev_date || "";
+  const dd = useDeepDive("feedback", analysisDate);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [resultSort, setResultSort] = useState<"asc" | "desc" | null>(null);
+  const [trackingNote, setTrackingNote] = useState("");
+  const trackingNoteKey = `vibe-astock-feedback-tracking-note:${analysisDate || "unassigned"}`;
+  useEffect(() => {
+    setSelected(new Set());
+    setResultSort(null);
+    try { setTrackingNote(localStorage.getItem(trackingNoteKey) || ""); }
+    catch { setTrackingNote(""); }
+  }, [trackingNoteKey]);
+  const updateTrackingNote = (value: string) => {
+    setTrackingNote(value);
+    try { localStorage.setItem(trackingNoteKey, value); } catch { /* 隐私模式下仅保留当前页面 */ }
+  };
   // 板位写具体高度（首板/2板/3板/…/9板），档位动态从 matrix 键生成：
   // 首板固定最前、「昨日炸板」固定最后，中间按数字升序
   const tierOrder = (t: string) =>
     t === "首板" ? 1 : t === "昨日炸板" ? Number.MAX_SAFE_INTEGER : (parseInt(t, 10) || Number.MAX_SAFE_INTEGER - 1);
   const tiers = Object.keys(matrix).sort((a, b) => tierOrder(a) - tierOrder(b));
   const cols = ["晋级涨停", "收红", "小跌", "跌超5%", "跌停"] as const;
+  const resultRank: Record<string, number> = { "跌停": 0, "跌超5%": 1, "小跌": 2, "收红": 3, "晋级涨停": 4 };
+  const sortedRows = (rows: FeedbackDetail[]) => resultSort == null ? rows : [...rows].sort((a, b) => {
+    const delta = (resultRank[a.result] ?? -1) - (resultRank[b.result] ?? -1);
+    return resultSort === "asc" ? delta : -delta;
+  });
+  const toggleResultSort = () => setResultSort((current) => current === "asc" ? "desc" : current === "desc" ? null : "asc");
+  const toggleSelected = (code: string) => setSelected((current) => {
+    const next = new Set(current);
+    if (next.has(code)) next.delete(code); else next.add(code);
+    return next;
+  });
+  const item = (d: FeedbackDetail): DiveItem => ({
+    key: d.code,
+    name: d.name,
+    context: `${analysisDate} 复盘反馈 · ${d.prev_tier} ${d.name}(${d.code})`,
+    prepareContext: async () => {
+      try {
+        const data = await api.dragonTiger(d.code, analysisDate);
+        return formatDragonTigerContext(data, analysisDate);
+      } catch (error) {
+        return `龙虎榜预取失败：${error instanceof Error ? error.message : "数据源暂不可用"}。不得据此推测席位或游资。`;
+      }
+    },
+    prompt: `${analysisDate} 收盘复盘中，昨日强势股「${d.name}（${d.code}）」的客观反馈：\n` +
+      `昨日身份 ${d.prev_tier}；昨日涨停原因题材：${d.reason || "暂缺"}；` +
+      `本日涨跌 ${d.ret > 0 ? "+" : ""}${d.ret}%（${d.result}），行业 ${d.sector || "未知"}。` +
+      (d.next_session ? `\n下一交易日 ${d.next_session.date} 收盘 ${d.next_session.ret > 0 ? "+" : ""}${d.next_session.ret}%（${d.next_session.result}）。` : "") +
+      "\n\n请对这段已经发生的强势股反馈做完整复盘，不要只给结论或一两段概述。正文建议 800—1500 个中文字符，并严格按以下章节展开：\n" +
+      "1. **结论与关键数据速览**：先概括昨日强势身份、本日结果及最重要的强弱变化；\n" +
+      `2. **驱动复原**：先调用工具查询截至上述复盘日的近期新闻与研报；调用 query_news / query_reports 时必须传 end_date=${analysisDate}，标明资料日期，结合昨日涨停原因说明消息面、题材面和资金面驱动；不得用复盘日之后的信息倒推；\n` +
+      "3. **题材反馈**：分析本日表现对该题材扩散、分歧、承接与所处阶段反映了什么，只判断已经发生的板块反馈；\n" +
+      `4. **龙虎榜席位**：查询 ${analysisDate} 及此前近期记录。若上榜，必须分为“买方席位分析”“卖方席位分析”“买卖双方对照”三个小节；任一侧数据为空时明确写明缺失，不得臆测；\n` +
+      "5. **席位与游资画像**：仅对能被公开资料可靠识别的席位说明可能关联的游资、公开风评及操作风格，明确区分事实、市场称谓和推断；\n" +
+      "6. **风险与待验证项**：列出数据缺口、驱动证伪点、题材退潮信号及后续应核对的客观指标。\n\n" +
+      "只分析已发生事实，不预测个股未来涨跌、不给买卖建议、不推荐标的。输出纯 Markdown。",
+  });
+  const exportSelected = () => {
+    const rows = details.filter((d) => selected.has(d.code));
+    if (!rows.length) return;
+    const content = `# 昨日强势股反馈明细 · ${analysisDate || "未标日期"}\n\n` +
+      `已选 ${rows.length} 只；以下为已冻结的复盘数据，AI 分析仅供研究参考，不构成投资建议。\n` +
+      (trackingNote.trim() ? `\n## 跟踪备注\n\n${trackingNote.trim()}\n` : "\n") +
+      rows.map((d) => {
+        const light = d.traffic_light;
+        const signalText = (signal: { label: string; detail: string; state: string; members?: Array<{ code?: string; name?: string; seal_time?: string; last_seal_time?: string; break_count?: number }> }) => {
+          const peers = (signal.members || []).filter((member) => member.code !== d.code);
+          const peerText = peers.length ? `；同方向封板：${peers.map((member) =>
+            `${member.name || member.code || "未知标的"}${member.code ? `（${member.code}）` : ""}` +
+            `${member.seal_time ? `，首封${member.seal_time}` : ""}${member.last_seal_time ? `，末封${member.last_seal_time}` : ""}` +
+            `${member.break_count != null ? `，开板${member.break_count}次` : ""}`).join("；")}` : "";
+          return `${signal.label}=${signal.detail}（${signal.state}）${peerText}`;
+        };
+        const lightDetail = !light ? "未记录" : [
+          `总灯：${light.label}（${light.light}）`, `结论：${light.summary}`,
+          `质量灯：${light.quality?.label || "—"}；${light.quality?.summary || "—"}`,
+          `质量因子：${(light.quality?.signals || []).map(signalText).join("；") || "—"}`,
+          `动作：${light.action?.label || "—"}；${light.action?.summary || "—"}`,
+          `因子：${(light.signals || []).map(signalText).join("；") || "—"}`,
+          `阻断：${light.blockers.join("、") || "无"}`, `缺失：${light.missing.join("、") || "无"}`,
+        ].join("\n  ");
+        return `## ${d.name}（${d.code}）\n\n- 昨日身份：${d.prev_tier}\n- 涨停原因：${d.reason || "暂缺"}\n- 今日反馈：${d.ret > 0 ? "+" : ""}${d.ret}% · ${d.result}\n- 行业：${d.sector || "暂缺"}` +
+          (d.next_session ? `\n- 次日反馈：${d.next_session.date} ${d.next_session.ret > 0 ? "+" : ""}${d.next_session.ret}% · ${d.next_session.result}` : "") +
+          `\n\n### 当日收盘灯\n\n${lightDetail}\n\n### 深入分析\n\n${dd.analysis[d.code]?.trim() || "暂无已完成深入分析。"}`;
+      }).join("\n\n---\n\n") + "\n";
+    const url = URL.createObjectURL(new Blob([content], { type: "text/markdown;charset=utf-8" }));
+    const anchor = document.createElement("a");
+    anchor.href = url; anchor.download = `昨日强势股反馈_${analysisDate || "未标日期"}.md`;
+    document.body.appendChild(anchor); anchor.click(); anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const detailTable = (rows: FeedbackDetail[], label: string) => (
+    <details className="mt-2" key={label}>
+      <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">{label}</summary>
+      <div className="mt-1 max-h-80 overflow-auto">
+        <table className="w-full min-w-[1080px] text-[11px] tabular-nums">
+          <thead className="sticky top-0 bg-card text-left text-[10px] text-muted-foreground"><tr className="border-b border-border/50">
+            <th className="w-7 py-1"><input type="checkbox" aria-label={`选择${label}全部股票`} checked={rows.length > 0 && rows.every((d) => selected.has(d.code))}
+              onChange={(event) => setSelected((current) => { const next = new Set(current); rows.forEach((d) => event.target.checked ? next.add(d.code) : next.delete(d.code)); return next; })} /></th>
+            <th className="pr-2 font-medium">名称</th><th className="pr-2 font-medium">代码</th><th className="pr-2 font-medium">昨日身份</th><th className="pr-2 font-medium">涨停原因</th><th className="pr-2 font-medium">今日涨幅</th><th className="pr-2 font-medium"><button type="button" onClick={toggleResultSort} className="inline-flex items-center gap-1 hover:text-primary" title="按结果排序：跌停、跌超5%、小跌、收红、晋级涨停"><span>今日结果</span><span className="text-[9px]">{resultSort === "asc" ? "↑" : resultSort === "desc" ? "↓" : "↕"}</span></button></th><th className="pr-2 font-medium">当日收盘灯</th><th className="pr-2 font-medium">次日涨幅</th><th className="pr-2 font-medium">晋级结果</th><th className="pr-2 font-medium">行业</th><th className="font-medium">深入分析</th>
+          </tr></thead>
+          <tbody>{sortedRows(rows).map((d) => <Fragment key={d.code}>
+            <tr className="border-b border-border/30 last:border-0">
+              <td className="py-1"><input type="checkbox" aria-label={`选择${d.name}`} checked={selected.has(d.code)} onChange={() => toggleSelected(d.code)} /></td>
+              <td className="pr-2 font-semibold"><StockLink code={d.code}>{d.name}</StockLink></td><td className="pr-2 text-muted-foreground"><StockLink code={d.code}>{d.code}</StockLink></td><td className="pr-2 text-muted-foreground">{d.prev_tier}</td><td className="max-w-44 truncate pr-2" title={d.reason}>{d.reason || <span className="text-muted-foreground/50">暂缺</span>}</td>
+              <td className={cn("pr-2 font-bold", pctColor(d.ret))}>{d.ret > 0 ? "+" : ""}{d.ret}%</td><td className="pr-2">{d.result}</td><td className="whitespace-nowrap pr-2 py-1">{d.traffic_light ? <StockTrafficBadge light={d.traffic_light} /> : <span className="text-muted-foreground/50">未记录</span>}</td>
+              <td className={cn("whitespace-nowrap pr-2 font-bold", d.next_session && pctColor(d.next_session.ret))}>{d.next_session ? <>{d.next_session.ret > 0 ? "+" : ""}{d.next_session.ret}%</> : <span className="font-normal text-muted-foreground/50">—</span>}</td><td className="whitespace-nowrap pr-2">{d.next_session?.result ?? <span className="text-muted-foreground/50">—</span>}</td><td className="pr-2 text-muted-foreground">{d.sector}</td>
+              <td><button type="button" onClick={() => dd.toggle(item(d))} disabled={dd.busy && !dd.analysis[d.code] && !dd.runningKeys.includes(d.code) && !dd.queuedKeys.includes(d.code)} className="inline-flex items-center gap-1 rounded border border-primary/50 bg-primary/10 px-1.5 py-0.5 text-primary disabled:opacity-40">{dd.runningKeys.includes(d.code) ? <Loader2 className="h-3 w-3 animate-spin" /> : dd.open === d.code ? <X className="h-3 w-3" /> : <Sparkles className="h-3 w-3" />}{dd.open === d.code ? "收起" : dd.completed[d.code] ? "展开" : "分析"}</button></td>
+            </tr>
+            {dd.open === d.code && <DeepDivePanel dd={dd} stockKey={d.code} colSpan={12} noteTitle={`反馈深析 · ${d.name} ${d.prev_tier}`} onRerun={() => dd.rerun(item(d))} />}
+          </Fragment>)}</tbody>
+        </table>
+      </div>
+    </details>
+  );
   return (
     <Section
       icon={Rows3}
@@ -78,6 +195,15 @@ export function Matrix({ fm }: { fm?: FeedbackMatrix }) {
       hint="昨天涨停/炸板的票，今天分别落到哪一档。均值只说冷热，这张表告诉你亏钱集中在哪个板位。"
       available={fm?.available}
       reason={fm?.reason}
+      action={<>
+        <span className="text-[11px] text-muted-foreground">已选 {selected.size} 只</span>
+        <button type="button" onClick={() => setSelected(new Set())} disabled={!selected.size}
+          className="inline-flex h-7 w-7 items-center justify-center rounded border border-border text-muted-foreground hover:text-primary disabled:opacity-40" title="清空勾选" aria-label="清空反馈股票勾选"><X className="h-3.5 w-3.5" /></button>
+        <button type="button" onClick={() => dd.runAll(details.filter((d) => selected.has(d.code)).map(item))} disabled={!selected.size || dd.busy}
+          className="inline-flex h-7 items-center gap-1 rounded border border-primary/50 bg-primary/10 px-2 text-[11px] text-primary hover:bg-primary/20 disabled:opacity-40" aria-label="选中一键分析反馈股票"><Sparkles className="h-3.5 w-3.5" />选中一键分析</button>
+        <button type="button" onClick={exportSelected} disabled={!selected.size}
+          className="inline-flex h-7 items-center gap-1 rounded border border-border px-2 text-[11px] text-muted-foreground hover:text-primary disabled:opacity-40" aria-label="导出已勾选反馈股票"><Download className="h-3.5 w-3.5" />导出</button>
+      </>}
     >
       {fm?.note && <p role="status" className="mb-2 text-xs text-warning">{fm.note}</p>}
       {tiers.length === 0 ? (
@@ -96,7 +222,8 @@ export function Matrix({ fm }: { fm?: FeedbackMatrix }) {
               {tiers.map((t) => {
                 const c = matrix[t];
                 return (
-                  <tr key={t} className="border-b border-border/50 last:border-0">
+                  <Fragment key={t}>
+                  <tr className="border-b border-border/50 last:border-0">
                     <td className="py-1.5 font-semibold">{t}<span className="ml-1 text-muted-foreground">({c.合计})</span></td>
                     <td className={cn("px-1.5 py-1.5 text-right", countColor("up"))}>{c.晋级涨停}</td>
                     <td className="px-1.5 py-1.5 text-right">{c.收红}</td>
@@ -105,40 +232,27 @@ export function Matrix({ fm }: { fm?: FeedbackMatrix }) {
                     <td className={cn("px-1.5 py-1.5 text-right font-bold", countColor("down"))}>{c.跌停}</td>
                     <td className="px-1.5 py-1.5 text-right font-bold">{rate(c.晋级率)}</td>
                   </tr>
+                  <tr className="border-b border-border/50 last:border-0"><td colSpan={7} className="pb-2 pl-2">
+                    {detailTable(details.filter((d) => d.prev_tier === t), `${t} 明细（${c.合计} 只，按今日表现从差到好）`)}
+                  </td></tr>
+                  </Fragment>
                 );
               })}
             </tbody>
           </table>
         </div>
       )}
-      {/* 明细：后端已产出每只票的结果，之前完全没展示（半截功能）。
-          默认折叠 —— 复盘先看矩阵，要追到具体哪只票再展开。按今日结果从差到好排。*/}
-      {safeArray<FeedbackDetail>(fm?.details).length > 0 && (
-        <details className="mt-3">
-          <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
-            展开明细（{safeArray<FeedbackDetail>(fm?.details).length} 只，按今日表现从差到好）
-          </summary>
-          <div className="mt-2 max-h-64 overflow-y-auto">
-            <table className="w-full text-[11px] tabular-nums">
-              <tbody>
-                {safeArray<FeedbackDetail>(fm?.details).map((d) => (
-                  <tr key={d.code} className="border-b border-border/30 last:border-0">
-                    <td className="py-1 pr-2 font-semibold">{d.name}</td>
-                    <td className="pr-2 text-muted-foreground">{d.code}</td>
-                    <td className="pr-2 text-muted-foreground">{d.prev_tier}</td>
-                    <td className={cn("pr-2 font-bold",
-                      pctColor(d.ret))}>
-                      {d.ret > 0 ? "+" : ""}{d.ret}%
-                    </td>
-                    <td className="pr-2">{d.result}</td>
-                    <td className="truncate text-muted-foreground">{d.sector}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </details>
-      )}
+      {details.length > 0 && detailTable(details, `展开明细（${details.length} 只，按今日表现从差到好）`)}
+      <div className="mt-4 border-t border-border/60 pt-3">
+        <div className="mb-1 flex items-center justify-between gap-3">
+          <label htmlFor="feedback-tracking-note" className="text-xs font-semibold">跟踪备注</label>
+          <span className="text-[10px] text-muted-foreground">按 {analysisDate || "当前复盘"} 保存到本机 · 导出时一并带出</span>
+        </div>
+        <textarea id="feedback-tracking-note" aria-label="昨日强势股反馈跟踪备注" value={trackingNote}
+          onChange={(event) => updateTrackingNote(event.target.value)} maxLength={4000} rows={3}
+          placeholder="记录当日观察、复盘想法或后续验证点…"
+          className="w-full resize-y rounded-lg border border-border bg-background/60 px-3 py-2 text-xs leading-relaxed outline-none placeholder:text-muted-foreground/50 focus:border-primary/60" />
+      </div>
     </Section>
   );
 }
@@ -176,8 +290,8 @@ export function Themes({ ts }: { ts?: ThemeStructure }) {
                 safeArray<{ name: string; boards: number }>(t.names)
                   .map((x) => `${x.name}(${x.boards}板)`).join("、")
               }>
-                {safeArray<{ name: string; boards: number }>(t.names).slice(0, 3)
-                  .map((x) => `${x.name}${x.boards}板`).join(" ")}
+                {safeArray<{ code: string; name: string; boards: number }>(t.names).slice(0, 3)
+                  .map((x) => <StockLink key={x.code} code={x.code} className="mr-1">{x.name}{x.boards}板</StockLink>)}
               </span>
             )}
           </div>
@@ -319,18 +433,30 @@ const STATE_TONE: Record<string, string> = {
 };
 
 /** 题材事件树 —— 按真实事件题材（问财涨停原因）而不是行业分类 */
-export function ThemeTreeView({ t }: { t?: ThemeTree }) {
+export function ThemeTreeView({ t, status }: { t?: ThemeTree; status?: IwencaiStatus }) {
   const themes = safeArray<ThemeNode>(t?.themes);
+  const meta = t?.reason_meta;
+  const sourceLabel = meta?.source === "iwencai" ? "问财"
+    : meta?.source === "ths_public" ? "同花顺公开涨停揭秘"
+    : meta?.source === "mixed" ? "问财 + 公开源补齐"
+    : meta?.source === "legacy" ? "历史缓存（旧格式）"
+    : meta?.source === "unavailable" ? "问财与公开源均不可用"
+    : "历史存档，来源未记录";
   return (
     <Section
       icon={Network}
       title="题材事件树"
       hint={
         "按涨停原因题材聚合（公开涨停揭秘或问财，源站归因非公司确认），不是行业分类 —— 「兵装重组」「间接投资长鑫科技」"
-        + "这类事件在行业分类里找不到。每行按复盘顺序摆：昨日反馈 → 今天几点首封 → 扩散几只 → 梯队多高 → 炸了几个。"
+        + "这类事件在行业分类里找不到。业绩增长、回购、增持等跨行业事件标为「共同催化」，不冒充产业题材参与首板题材支持评分。"
+        + "每行按复盘顺序摆：昨日反馈 → 今天几点首封 → 扩散几只 → 梯队多高 → 炸了几个。"
       }
       available={t?.available}
       reason={t?.reason}
+      action={(meta || status) && <span className={cn("text-[10px] tabular-nums", status?.circuit_state && status.circuit_state !== "ready" ? "text-warning" : "text-muted-foreground")} title={status?.circuit_reason || undefined}>
+        {sourceLabel}{status ? ` · 问财今日 ${status.requests_today} 次 / 失败 ${status.failures_today}` : ""}
+        {status && status.circuit_state !== "ready" && " · 已熔断"}
+      </span>}
     >
       {themes.length === 0 ? (
         <p className="text-[13px] text-muted-foreground/70">无可聚合题材</p>
@@ -342,6 +468,7 @@ export function ThemeTreeView({ t }: { t?: ThemeTree }) {
               <div key={n.tag} className="border-b border-border/40 pb-2 last:border-0 last:pb-0">
                 <div className="flex flex-wrap items-center gap-2 text-[13px]">
                   <span className="font-bold">{n.tag}</span>
+                  {n.kind === "catalyst" && <span className="rounded bg-info/10 px-1.5 py-0.5 text-[10px] font-bold text-info" title="跨行业共同事件，只作催化观察，不等同于产业题材">共同催化</span>}
                   <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-bold",
                     STATE_TONE[n.state] || "bg-muted text-muted-foreground")}>{n.state}</span>
                   <span className="tabular-nums text-muted-foreground">
@@ -366,10 +493,10 @@ export function ThemeTreeView({ t }: { t?: ThemeTree }) {
                       {n.continuation_rate != null && `（延续 ${rate(n.continuation_rate)}）`}
                     </span>
                   )}
-                  {safeArray<{ name: string; boards: number; label?: string }>(n.members).length > 0 && (
+                  {safeArray<{ code: string; name: string; boards: number; label?: string }>(n.members).length > 0 && (
                     <span className="truncate opacity-70">
-                      {safeArray<{ name: string; boards: number; label?: string }>(n.members).slice(0, 4)
-                        .map((m) => `${m.name}${m.label ?? `${m.boards}板`}`).join("、")}
+                      {safeArray<{ code: string; name: string; boards: number; label?: string }>(n.members).slice(0, 4)
+                        .map((m, i) => <span key={m.code}>{i > 0 && "、"}<StockLink code={m.code}>{m.name}{m.label ?? `${m.boards}板`}</StockLink></span>)}
                     </span>
                   )}
                 </div>
@@ -381,6 +508,13 @@ export function ThemeTreeView({ t }: { t?: ThemeTree }) {
             {t?.coverage_rate != null && `（${rate(t.coverage_rate)}）`}
             {t?.concentration != null && ` · 头部占全市场涨停 ${rate(t.concentration)}`}
           </p>
+          <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-muted-foreground/80">
+            <span>数据源：{sourceLabel}</span>
+            {meta?.fetched_at && <span>获取/缓存：{meta.fetched_at.replace("T", " ")}</span>}
+            {meta && <span>{meta.settled ? "收盘定稿" : "盘中缓存"}{meta.cache_hit ? " · 已复用" : ""}</span>}
+            {status && <span>今日问财 HTTP 请求 {status.requests_today} · 失败 {status.failures_today}</span>}
+            {status?.circuit_state !== "ready" && <span className="text-warning">熔断：{status?.circuit_reason || status?.circuit_state}{status?.blocked_until ? `（至 ${status.blocked_until.replace("T", " ")}）` : ""}</span>}
+          </div>
         </>
       )}
     </Section>
@@ -411,8 +545,8 @@ export function Ledger({ el }: { el?: EventLedger }) {
     <div className="flex items-center gap-2 border-b border-border/40 py-1 text-[12px] last:border-0">
       <span className={cn("shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold",
         TAG_TONE[e.tag] || "bg-muted text-muted-foreground")}>{e.tag}</span>
-      <span className="font-semibold">{e.name}</span>
-      <span className="shrink-0 text-[10px] text-muted-foreground">{e.code}</span>
+      <StockLink code={e.code} className="font-semibold">{e.name}</StockLink>
+      <StockLink code={e.code} className="shrink-0 text-[10px] text-muted-foreground">{e.code}</StockLink>
       {e.boards > 0 && <span className="shrink-0 text-[11px] text-primary">{e.boards}板</span>}
       <span className={cn("shrink-0 tabular-nums", pctColor(e.ret))}>{signed(e.ret)}</span>
       <span className="truncate text-[11px] text-muted-foreground">{e.sector} · {e.note}</span>

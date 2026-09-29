@@ -19,6 +19,29 @@ DAILY_CALLS = {"get_sentiment_data", "get_emotion_metrics", "get_market_facts", 
                "get_macro_sector_data", "get_theme_reasons", "get_dragon_tiger_data", "get_leader_data"}
 
 
+def _worker_environment(name: str, directory) -> dict:
+    """Build the minimal worker environment, including only needed secrets."""
+    from .runtime import REPO, engine_environment
+
+    env = engine_environment(Path(directory))
+    if os.environ.get("ASTOCK_DATA_HOME"):
+        env["ASTOCK_DATA_HOME"] = os.environ["ASTOCK_DATA_HOME"]
+    if name in DAILY_CALLS | {"get_theme"}:
+        try:
+            from duanxian.fetchers import _load_env
+            from duanxian.data_credentials import get_iwencai_key
+
+            _load_env()
+            key = get_iwencai_key()
+        except Exception:
+            key = os.environ.get("IWENCAI_API_KEY", "").strip()
+        if key:
+            env["IWENCAI_API_KEY"] = key
+    env["PYTHONPATH"] = str(REPO)
+    env["VIBE_ASTOCK_PROMPTS"] = "builtin"
+    return env
+
+
 
 def fetch_public(name, args, directory, check, *, timeout=90):
     from .runtime import REPO, engine_environment, stop_process
@@ -26,13 +49,7 @@ def fetch_public(name, args, directory, check, *, timeout=90):
         raise EvidenceError("取数接口不在本次允许范围")
     budget = min(float(check()), timeout)
     path = Path(directory) / ("worker-" + uuid.uuid4().hex + ".jsonl")
-    env = engine_environment(Path(directory))
-    if os.environ.get("ASTOCK_DATA_HOME"):
-        env["ASTOCK_DATA_HOME"] = os.environ["ASTOCK_DATA_HOME"]
-    if name in DAILY_CALLS and os.environ.get("IWENCAI_API_KEY"):
-        env["IWENCAI_API_KEY"] = os.environ["IWENCAI_API_KEY"]
-    env["PYTHONPATH"] = str(REPO)
-    env["VIBE_ASTOCK_PROMPTS"] = "builtin"
+    env = _worker_environment(name, directory)
     proc = None
     try:
         with path.open("xb") as output:

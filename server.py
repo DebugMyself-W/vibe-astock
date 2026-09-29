@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from duanxian import (
-    app_settings, live_emotion, overseas, preflight, reflection, review_store,
+    app_settings, breadth, data_credentials, live_emotion, overseas, preflight, reflection, review_store,
     stock_explorer, theme_reasons, trade_calendar,
 )
 from duanxian.review_store import md_to_html as _md_to_html, strip_prefix as _strip_prefix
@@ -36,6 +36,7 @@ from duanxian.util import (
     safe_join, strip_model_noise, validate_trade_date,
 )
 from duanxian.prompts import PACK
+from net_utils import diagnose_market_network, market_network_status
 
 SCHEMA_VERSION = 1
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -278,8 +279,8 @@ _DISABLED_CLIS = _disable_unsafe_clis()
 _VR_API_KEY = os.environ.get("VR_API_KEY", "").strip()
 
 # This addition is local-only and has its own credentials/data directory.
-from review_agent.api import Manager as ReviewAgentManager, create_router as review_agent_router
-from review_agent.runtime import Runtime as ReviewAgentRuntime
+from review_agent.api import DailyInput, Manager as ReviewAgentManager, ModelInput, create_router as review_agent_router
+from review_agent.runtime import Runtime as ReviewAgentRuntime, connection as review_agent_connection
 from review_agent.store import Store as ReviewAgentStore
 from review_agent.evidence import EvidenceError as ReviewAgentError
 
@@ -821,10 +822,14 @@ def api_market_industry_peers(
     industry: str = Query(..., min_length=1, max_length=40),
     code: str = Query("", pattern=r"^$|^\d{6}$"),
     limit: int = Query(300, ge=1, le=500),
+    date: Optional[str] = Query(None),
 ):
-    """点击连板股后展示其当前同行业成分，响应显式标注行情日期。"""
+    """点击连板股后展示同行业成分；历史页主源失败时只降级到该日冻结样本。"""
     try:
-        return stock_explorer.industry_peers(industry, code, limit)
+        review_date = validate_trade_date(date) if date else None
+        return stock_explorer.industry_peers(industry, code, limit, date=review_date)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(
             {"available": False, "reason": f"同行业数据暂不可用：{type(exc).__name__}", "members": []},
@@ -889,8 +894,19 @@ def api_latest(date: Optional[str] = None):
     if payload is None or not review_store.usable(payload):
         # 空对象 = 「这天没有」，前端据此显示"还没跑过"；带上 date 好让前端知道问的是哪天
         return JSONResponse({"requested_date": date} if date else {}, status_code=200)
+    facts = payload.get("market_facts")
+    old_breadth = facts.get("breadth") if isinstance(facts, dict) else None
+    anchor = payload.get("target_date") or payload.get("trade_date")
+    if (isinstance(old_breadth, dict) and not old_breadth.get("dist_available")
+            and isinstance(anchor, str)):
+        # A failed source snapshot must not become permanently stale while the
+        # selected date is still the latest confirmed close. market_breadth()
+        # itself refuses mismatched historical/live dates, so this cannot put
+        # today's distribution onto an older report.
+        fresh_breadth = breadth.market_breadth(anchor)
+        if fresh_breadth.get("dist_available"):
+            payload = {**payload, "market_facts": {**facts, "breadth": fresh_breadth}}
     try:
-        anchor = payload.get("target_date") or payload.get("trade_date")
         payload["reflection"] = reflection.latest_reflection(end=anchor)
         payload["scoreboard"] = reflection.scoreboard(end=anchor)
     except Exception as exc:  # noqa: BLE001  战绩算不出来不该让整个复盘打不开
@@ -899,7 +915,13 @@ def api_latest(date: Optional[str] = None):
 
 
 def _settings_response() -> dict:
-    return {**app_settings.get_settings(), "iwencai": theme_reasons.current_status()}
+    iwencai = theme_reasons.current_status()
+    iwencai.update(data_credentials.iwencai_key_status())
+    return {
+        **app_settings.get_settings(),
+        "iwencai": iwencai,
+        "market_network_status": market_network_status(),
+    }
 
 
 @app.get("/api/settings")
@@ -916,12 +938,78 @@ def api_settings_update(request: Request, body: dict = Body(...)):
     if "iwencai_intraday_refresh_minutes" not in body:
         return JSONResponse({"detail": "缺少 iwencai_intraday_refresh_minutes"}, status_code=422)
     try:
-        app_settings.update_settings(body["iwencai_intraday_refresh_minutes"], body.get("review_schedule"))
+        app_settings.update_settings(
+            body["iwencai_intraday_refresh_minutes"],
+            body.get("review_schedule"),
+            body.get("market_network"),
+        )
     except ValueError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=422)
     except OSError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=500)
     return _settings_response()
+
+
+@app.put("/api/settings/iwencai-key")
+def api_iwencai_key_update(request: Request, body: dict = Body(...)):
+    if _VR_API_KEY and request.headers.get("authorization", "") != f"Bearer {_VR_API_KEY}":
+        return JSONResponse({"detail": "未授权：缺少或错误的 VR_API_KEY"}, status_code=401)
+    if not _origin_ok(request):
+        return JSONResponse({"detail": "非法来源"}, status_code=403)
+    try:
+        data_credentials.save_iwencai_key(body.get("api_key", ""))
+        theme_reasons.reset_runtime_status()
+    except ValueError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+    except OSError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=500)
+    return _settings_response()
+
+
+@app.delete("/api/settings/iwencai-key")
+def api_iwencai_key_delete(request: Request):
+    if _VR_API_KEY and request.headers.get("authorization", "") != f"Bearer {_VR_API_KEY}":
+        return JSONResponse({"detail": "未授权：缺少或错误的 VR_API_KEY"}, status_code=401)
+    if not _origin_ok(request):
+        return JSONResponse({"detail": "非法来源"}, status_code=403)
+    try:
+        data_credentials.clear_iwencai_key()
+        theme_reasons.reset_runtime_status()
+    except OSError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=500)
+    return _settings_response()
+
+
+@app.post("/api/settings/market-network/diagnose")
+def api_market_network_diagnose(request: Request):
+    if _VR_API_KEY and request.headers.get("authorization", "") != f"Bearer {_VR_API_KEY}":
+        return JSONResponse({"detail": "未授权：缺少或错误的 VR_API_KEY"}, status_code=401)
+    if not _origin_ok(request):
+        return JSONResponse({"detail": "非法来源"}, status_code=403)
+    return diagnose_market_network()
+
+
+@app.post("/api/review/retry-scheduled")
+def api_retry_scheduled_review(request: Request):
+    """重试最近一次失败的定时复盘，继续使用当时保存的订阅来源。"""
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    schedule = app_settings.get_settings().get("review_schedule") or {}
+    date = schedule.get("last_date")
+    if schedule.get("last_status") != "failed" or not date:
+        return JSONResponse({"error": "当前没有可重试的失败定时复盘"}, status_code=409)
+    manager = getattr(app.state, "review_agent", None)
+    if manager is None:
+        return JSONResponse({"error": "复盘 Agent 服务尚未启动"}, status_code=503)
+    try:
+        result = _submit_scheduled_review(manager, date, schedule)
+    except ReviewAgentError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    triggered = china_now().strftime("%Y-%m-%d %H:%M:%S") + " CST"
+    app_settings.mark_review_schedule_run(date, triggered)
+    if result.get("already_done"):
+        app_settings.mark_review_schedule_result(date, "succeeded", triggered, 0)
+    return result
 
 
 # ==================== ③ 近 5 天热度 ====================
@@ -1865,6 +1953,9 @@ def _legacy_api_dd_chat(request: Request, body: dict):
 #    机器在别的时区时，用本机时间会整天抓不到任何一个时点，而界面上看不出异样。
 _intraday_thread_started = False
 _intraday_start_lock = threading.Lock()
+_review_scheduler_stop = threading.Event()
+_review_scheduler_thread: threading.Thread | None = None
+_REVIEW_SCHEDULER_POLL_SECONDS = 30
 
 
 def _intraday_scheduler() -> None:
@@ -1944,6 +2035,93 @@ def _start_intraday() -> None:
         _intraday_thread_started = True  # ⚠️ 只在 start() 成功之后才置位
 
 
+def _finish_scheduled_status(manager: ReviewAgentManager, schedule: dict) -> bool:
+    """把新版 Daily 任务的终态同步回全局设置；返回是否仍在运行。"""
+    if schedule.get("last_status") != "running" or not schedule.get("last_date"):
+        return False
+    status = manager.daily.snapshot()
+    if status.get("date") != schedule["last_date"]:
+        # 服务重启后 Daily 会把被中断的任务落为 failed；若期间又跑过别的日期，
+        # snapshot 只保留最新任务，不能让设置页永远挂着“运行中”。
+        if not status.get("running"):
+            app_settings.mark_review_schedule_result(
+                schedule["last_date"], "failed",
+                china_now().strftime("%Y-%m-%d %H:%M:%S") + " CST", 0,
+                "服务重启或任务状态已变化，未找到对应的定时复盘任务；请手动重试",
+            )
+        return False
+    if status.get("running"):
+        return True
+    final = "succeeded" if status.get("status") == "complete" else "failed"
+    error = status.get("error") or (None if final == "succeeded" else f"任务状态：{status.get('status') or '未知'}")
+    app_settings.mark_review_schedule_result(
+        schedule["last_date"], final,
+        china_now().strftime("%Y-%m-%d %H:%M:%S") + " CST",
+        int(status.get("elapsed") or 0), error,
+    )
+    return False
+
+
+def _submit_scheduled_review(manager: ReviewAgentManager, date: str, schedule: dict) -> dict:
+    source_config = schedule.get("source") or {}
+    source, key = review_agent_connection({**source_config, "baseURL": "", "apiKey": ""})
+    body = DailyInput(
+        date=date, request_id=uuid.uuid4().hex,
+        llm=ModelInput(provider=source["provider"], model=source["model"]),
+        force=bool(schedule.get("force")),
+    )
+    with manager.lock:
+        return manager.daily.submit(body, source, key)
+
+
+def _review_scheduler_tick(manager: ReviewAgentManager) -> None:
+    schedule = (app_settings.get_settings().get("review_schedule") or {})
+    if _finish_scheduled_status(manager, schedule):
+        return
+    schedule = (app_settings.get_settings().get("review_schedule") or {})
+    if not schedule.get("enabled"):
+        return
+    now = china_now()
+    if now.strftime("%H:%M") < str(schedule.get("time") or "15:30"):
+        return
+    date = trade_calendar.latest_session()
+    if not date or schedule.get("last_date") == date or not trade_calendar.is_settled(date):
+        return
+    try:
+        result = _submit_scheduled_review(manager, date, schedule)
+    except ReviewAgentError as exc:
+        # 其它 AI 任务占用时下轮再试，不把“稍后可重试”写成永久失败。
+        print(f"⚠️ 定时复盘本轮未启动：{exc}")
+        return
+    triggered = now.strftime("%Y-%m-%d %H:%M:%S") + " CST"
+    app_settings.mark_review_schedule_run(date, triggered)
+    if result.get("already_done"):
+        app_settings.mark_review_schedule_result(date, "succeeded", triggered, 0)
+
+
+def _review_scheduler_loop(manager: ReviewAgentManager) -> None:
+    while not _review_scheduler_stop.wait(_REVIEW_SCHEDULER_POLL_SECONDS):
+        try:
+            _review_scheduler_tick(manager)
+        except Exception as exc:  # noqa: BLE001  调度线程不能退出
+            print(f"⚠️ 定时复盘检查失败：{type(exc).__name__}: {exc}")
+
+
+def _start_review_scheduler(manager: ReviewAgentManager) -> None:
+    global _review_scheduler_thread
+    if _review_scheduler_thread and _review_scheduler_thread.is_alive():
+        return
+    _review_scheduler_stop.clear()
+    _review_scheduler_thread = threading.Thread(
+        target=_review_scheduler_loop, args=(manager,), name="review-scheduler", daemon=True,
+    )
+    _review_scheduler_thread.start()
+
+
+def _stop_review_scheduler() -> None:
+    _review_scheduler_stop.set()
+
+
 # ⚠️ 用 lifespan 不用 @app.on_event（后者已废弃，FastAPI 升级后会静默不执行 →
 # 盘中快照全天不抓，而界面上看不出任何异样）。
 @asynccontextmanager
@@ -1957,9 +2135,11 @@ async def _lifespan(_app: FastAPI):
     _app.state.review_agent = manager
     try:
         _start_intraday()
+        _start_review_scheduler(manager)
         collector.start()
         yield
     finally:
+        _stop_review_scheduler()
         collector.stop()
         manager.shutdown()
         _app.state.review_agent = None

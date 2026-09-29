@@ -3,13 +3,65 @@ import { createPortal } from "react-dom";
 import * as echarts from "echarts";
 import type { EChartsOption } from "echarts";
 import { ChevronDown, ExternalLink, LineChart, Loader2, X } from "lucide-react";
-import { api, type Blocks, type IndustryPeer, type IndustryPeers, type IntradayBundle, type KlineRow, type Quote } from "@/lib/api";
+import { StockConceptCard } from "@/components/StockConceptCard";
+import { api, type Blocks, type HotConcept, type IndustryPeer, type IndustryPeers, type IntradayBundle, type KlineRow, type Quote } from "@/lib/api";
 import { agentFetch, finite, safeArray, type LadderDetails, type LadderStock } from "@/lib/agent";
 import { cn } from "@/lib/utils";
 import { pctColor } from "@/lib/colors";
 
 
 const LINE_COLORS = ["#ea580c", "#2563eb", "#16a34a", "#a855f7", "#0891b2", "#ca8a04"];
+
+const industryPeersCache = new Map<string, IndustryPeers>();
+const industryPeersRequests = new Map<string, Promise<IndustryPeers>>();
+
+function industryPeersKey(stock: Pick<LadderStock, "code" | "industry">, reviewDate: string) {
+  return `${reviewDate}|${stock.industry}|${stock.code}`;
+}
+
+function loadIndustryPeers(stock: Pick<LadderStock, "code" | "industry">, reviewDate: string) {
+  const key = industryPeersKey(stock, reviewDate);
+  const cached = industryPeersCache.get(key);
+  if (cached) return Promise.resolve(cached);
+  const pending = industryPeersRequests.get(key);
+  if (pending) return pending;
+  const request = api.industryPeers(stock.industry, stock.code, 300, reviewDate)
+    .then((response) => {
+      if (response.available) industryPeersCache.set(key, response);
+      industryPeersRequests.delete(key);
+      return response;
+    })
+    .catch((error) => {
+      industryPeersRequests.delete(key);
+      throw error;
+    });
+  industryPeersRequests.set(key, request);
+  return request;
+}
+
+function industryPreview(stock: LadderStock, reviewDate: string): IndustryPeers {
+  return {
+    available: true,
+    preview: true,
+    board: { code: "", name: stock.industry || "同行业", basis: "industry" },
+    requested_date: reviewDate,
+    quote_date: reviewDate,
+    focus_code: stock.code,
+    total: 1,
+    members: [{
+      code: stock.code,
+      name: stock.name,
+      price: stock.price ?? null,
+      pct: stock.pct ?? null,
+      amount: stock.amount ?? null,
+      mcap: null,
+      float_cap: stock.float_cap ?? null,
+      industry: stock.industry,
+      is_focus: true,
+    }],
+    source: "local_focus_preview",
+  };
+}
 
 
 function signed(value?: number | null, digits = 2) {
@@ -190,6 +242,7 @@ function StockModal({ stock, quoteDate, onClose }: { stock: Pick<LadderStock, "c
   const [minute, setMinute] = useState<IntradayBundle | null>(null);
   const [daily, setDaily] = useState<KlineRow[]>([]);
   const [blocks, setBlocks] = useState<Blocks | null>(null);
+  const [hotConcepts, setHotConcepts] = useState<HotConcept[]>([]);
   const [chartTab, setChartTab] = useState<"minute" | "daily">("minute");
   const [intradayDays, setIntradayDays] = useState(1);
   const [intradayMenu, setIntradayMenu] = useState(false);
@@ -202,14 +255,15 @@ function StockModal({ stock, quoteDate, onClose }: { stock: Pick<LadderStock, "c
   const [loading, setLoading] = useState(true);
   useEffect(() => {
     let active = true;
-    setLoading(true);
+    setLoading(true); setBlocks(null); setHotConcepts([]); setSelectedConcept(null);
     Promise.allSettled([
-      api.quote(stock.code), api.kline(stock.code), api.blocks(stock.code),
+      api.quote(stock.code), api.kline(stock.code), api.blocks(stock.code), api.hotConcepts(stock.code),
     ]).then((results) => {
       if (!active) return;
       if (results[0].status === "fulfilled") setQuote(results[0].value[stock.code] || null);
       if (results[1].status === "fulfilled") setDaily(safeArray<KlineRow>(results[1].value));
       if (results[2].status === "fulfilled") setBlocks(results[2].value);
+      if (results[3].status === "fulfilled") setHotConcepts(safeArray<HotConcept>(results[3].value));
       setLoading(false);
     });
     return () => { active = false; };
@@ -268,9 +322,13 @@ function StockModal({ stock, quoteDate, onClose }: { stock: Pick<LadderStock, "c
           </div>
           {loading ? loadingBlock("加载行情数据…") : contentTab === "concept" ? (
             <div className="min-h-72 rounded-xl bg-muted/20 p-4">
-              <div className="flex flex-wrap gap-2">
-                {safeArray<string>(blocks?.concept_tags).length ? safeArray<string>(blocks?.concept_tags).map((tag) => <button key={tag} onClick={() => setSelectedConcept(tag)} className={cn("rounded-full border px-3 py-1.5 text-xs transition-colors hover:border-primary hover:bg-primary/10", selectedConcept === tag ? "border-primary bg-primary text-primary-foreground" : "border-border bg-card")}>{tag}</button>) : <p className="text-sm text-muted-foreground">概念归属暂不可用</p>}
-              </div>
+              <StockConceptCard
+                blocks={blocks}
+                hotConcepts={hotConcepts}
+                selectedConcept={selectedConcept}
+                onConceptClick={setSelectedConcept}
+                className="mb-0"
+              />
               {selectedConcept && <section className="mt-4 overflow-hidden rounded-xl border border-border bg-card">
                 <div className="flex items-center justify-between border-b border-border bg-muted/30 px-3 py-2"><span className="text-sm font-semibold">{selectedConcept} · 热门标的</span><button onClick={() => setSelectedConcept(null)} className="text-xs text-muted-foreground hover:text-foreground">收起</button></div>
                 {conceptLoading ? loadingBlock("加载概念热门标的…") : !conceptPeers?.available ? <p className="p-4 text-sm text-muted-foreground">{conceptPeers?.reason || "暂无可用成分数据"}</p> : <div className="max-h-64 divide-y divide-border/60 overflow-y-auto">{safeArray<IndustryPeer>(conceptPeers.members).map((item, index) => <button key={item.code} onClick={() => setConceptDetail(item)} className="grid w-full grid-cols-[28px_minmax(0,1fr)_68px] items-center gap-2 px-3 py-2 text-left hover:bg-muted/50"><span className="text-xs text-muted-foreground">{index + 1}</span><span><b className="block truncate text-sm">{item.name}</b><small className="font-mono text-[10px] text-muted-foreground">{item.code} · {item.industry || selectedConcept}</small></span><span className={cn("text-right font-mono text-xs font-semibold", pctColor(item.pct))}>{signed(item.pct)}</span></button>)}</div>}
@@ -293,23 +351,26 @@ function StockModal({ stock, quoteDate, onClose }: { stock: Pick<LadderStock, "c
 
 
 function IndustryDrawer({ stock, reviewDate, onClose }: { stock: LadderStock; reviewDate: string; onClose: () => void }) {
-  const [data, setData] = useState<IndustryPeers | null>(null);
+  const [data, setData] = useState<IndustryPeers>(() => industryPeersCache.get(industryPeersKey(stock, reviewDate)) || industryPreview(stock, reviewDate));
   const [lines, setLines] = useState<IntradayBundle | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !industryPeersCache.has(industryPeersKey(stock, reviewDate)));
   const [detail, setDetail] = useState<IndustryPeer | LadderStock | null>(null);
   const [mainCode, setMainCode] = useState(stock.code);
   const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   useEffect(() => {
     let active = true;
-    setLoading(true); setData(null); setLines(null);
+    const cached = industryPeersCache.get(industryPeersKey(stock, reviewDate));
+    setLoading(!cached); setData(cached || industryPreview(stock, reviewDate)); setLines(null);
     setMainCode(stock.code);
-    api.industryPeers(stock.industry, stock.code).then((response) => {
+    if (cached) return () => { active = false; };
+    loadIndustryPeers(stock, reviewDate).then((response) => {
       if (!active) return;
       setData(response);
-    }).catch(() => setData({ available: false, reason: "同行业数据加载失败", members: [] })).finally(() => { if (active) setLoading(false); });
+    }).catch(() => { if (active) setData({ available: false, reason: "同行业数据加载失败", members: [] }); })
+      .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [stock.code, stock.industry]);
+  }, [reviewDate, stock.code, stock.industry]);
 
   useEffect(() => {
     const previous = document.body.style.overflow;
@@ -354,18 +415,20 @@ function IndustryDrawer({ stock, reviewDate, onClose }: { stock: LadderStock; re
         <header className="flex items-center gap-3 border-b border-border px-5 py-4">
           <button aria-label="关闭同行业面板" onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted"><X className="h-5 w-5" /></button>
           <div className="min-w-0 flex-1"><h2 className="truncate text-base font-bold">{data?.board?.name || stock.industry || "同行业"} · 分时叠加</h2><p className="mt-0.5 text-[11px] text-muted-foreground">主票 {mainStock?.name || stock.name} · 从 {reviewDate} 连板标的进入 · {data?.quote_date || "最近交易日"} 行情</p></div>
-          <span className="text-xs text-muted-foreground">{data?.total ?? "—"} 只</span>
+          <span className="text-xs text-muted-foreground">{data?.total ?? "—"} {data?.preview ? "只先显示" : data?.degraded ? "只样本" : "只"}</span>
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
-          {loading ? loadingBlock("加载同行业标的…") : !data?.available ? <div className="rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-warning">{data?.reason || "数据不可用"}</div> : (
+          {loading && <div role="status" className="mb-3 flex items-center gap-2 rounded-xl border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />正在后台补全同行业标的…</div>}
+          {!data?.available ? <div className="rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-warning">{data?.reason || "数据不可用"}</div> : (
             <>
+              {data.note && <div className={cn("mb-3 rounded-xl border p-3 text-xs leading-relaxed", data.degraded ? "border-warning/30 bg-warning/10 text-warning" : "border-border bg-muted/30 text-muted-foreground")}>{data.note}{data.classification_date && ` 分类快照：${data.classification_date}。`}</div>}
               <section className="rounded-2xl border border-border bg-card/60 p-3">
-                <div className="mb-1 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground"><span>主票 + 板块涨幅前 5（去重）· 相对昨收 · 同一涨跌幅坐标</span><span className="font-medium text-primary">点击曲线反选下方标的</span></div>
+                <div className="mb-1 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground"><span>{data.preview ? "先显示主票；同行业标的后台补全" : data.degraded ? "主票 + 复盘日同行业涨停样本" : "主票 + 板块涨幅前 5（去重）"} · 相对昨收 · 同一涨跌幅坐标</span><span className="font-medium text-primary">点击曲线反选下方标的</span></div>
                 {!lines ? loadingBlock("切换主票并加载分时…") : <Chart option={option} className="h-[310px] w-full" onSeriesClick={selectMain} />}
                 {lines && !Object.values(lines.series).some((line) => line.points.length) && <p className="-mt-36 mb-28 text-center text-xs text-muted-foreground">该交易日分钟线暂不可用</p>}
               </section>
               <section className="mt-4 overflow-hidden rounded-2xl border border-border">
-                <div className="flex items-center justify-between bg-muted/40 px-4 py-2 text-xs font-semibold"><span>{data.board?.name}股票</span><span className="font-normal text-muted-foreground">按涨幅从高到低 · 点击切换主票</span></div>
+                <div className="flex items-center justify-between bg-muted/40 px-4 py-2 text-xs font-semibold"><span>{data.board?.name}{data.degraded ? "涨停样本" : "股票"}</span><span className="font-normal text-muted-foreground">按涨幅从高到低 · 点击切换主票</span></div>
                 <div className="max-h-[calc(100vh-460px)] divide-y divide-border/60 overflow-y-auto">
                   {members.map((item, index) => (
                     <div key={item.code} ref={(node) => { rowRefs.current[item.code] = node; }} role="button" tabIndex={0}
@@ -421,7 +484,7 @@ export function LadderDetailsPanel({ date }: { date: string }) {
             <div><div className="text-sm font-extrabold text-danger">{tier.boards}板</div><div className="text-[10px] text-muted-foreground">{tier.count} 封</div></div>
             <div className="flex min-w-0 flex-wrap gap-1.5">
               {safeArray<LadderStock>(tier.stocks).map((stock) => (
-                <button key={stock.code} onClick={() => setSelected(stock)} title={`${stock.name} ${stock.industry} ${stock.reason || ""}`} className="group min-w-[118px] flex-1 rounded-lg border border-border bg-card px-2 py-1.5 text-left shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5">
+                <button key={stock.code} onMouseEnter={() => { void loadIndustryPeers(stock, date).catch(() => undefined); }} onFocus={() => { void loadIndustryPeers(stock, date).catch(() => undefined); }} onClick={() => setSelected(stock)} title={`${stock.name} ${stock.industry} ${stock.reason || ""}`} className="group min-w-[118px] flex-1 rounded-lg border border-border bg-card px-2 py-1.5 text-left shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5">
                   <span className="flex items-center justify-between gap-2"><b className="truncate text-[12px]">{stock.name}</b><span className={cn("font-mono text-[11px]", pctColor(stock.pct))}>{signed(stock.pct)}</span></span>
                   <span className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-muted-foreground"><span className="truncate">{stock.industry || "行业未知"}</span><span>{stock.seal_time || "—"}</span></span>
                   <span className="mt-1 hidden items-center gap-1 text-[10px] font-medium text-primary group-hover:flex"><LineChart className="h-3 w-3" />同行业与行情 <ExternalLink className="h-2.5 w-2.5" /></span>

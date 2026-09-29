@@ -7,6 +7,9 @@ import { cn } from "@/lib/utils";
 import { reviewWarningMessages } from "@/lib/review-warnings";
 import { ReviewAgentChat } from "@/components/ReviewAgentChat";
 import { EvidenceReferences, GroundedAnalysis } from "@/components/ReportEvidence";
+import { FollowupPanel } from "@/components/FollowupPanel";
+import { BoardTrafficLightPanel, TrafficLightBadge } from "@/components/BoardTrafficLight";
+import { RegimeBadge } from "@/components/EmotionRegime";
 import {
   ConsecPremiumCard, CycleCard, LadderCard, MoneyEffectCard, PromotionCard, splitMetrics,
 } from "@/components/EmotionMetricsPanel";
@@ -184,6 +187,7 @@ export function AgentReview() {
   const [taskErr, setTaskErr] = useState("");
   // 「已复盘/还没收盘」这类不是错误、是正常告知，跟 err 分开显示
   const [notice, setNotice] = useState("");
+  const [followupEditable, setFollowupEditable] = useState(false);
   // polling: 防重入（React state 在同一轮渲染里读到的是旧值，双击能穿过去）
   // timer / alive: 卸载后停掉轮询，别再 setState
   // reqId: 只接受最后一次请求的响应，防止慢的旧响应覆盖新结果
@@ -393,6 +397,10 @@ export function AgentReview() {
             情绪温度 · 明日验证条件
             {data && ` · 交易日 ${data.target_date || data.trade_date} · 生成于 ${data.generated_at}`}
           </p>
+          {data && <div className="mt-1.5 flex flex-wrap items-center gap-2">
+            <RegimeBadge regime={data.emotion_regime} />
+            <TrafficLightBadge light={data.board_traffic_light} />
+          </div>}
         </div>
         <div className="flex items-center gap-2">
           <div className="flex flex-col items-start">
@@ -460,13 +468,14 @@ export function AgentReview() {
       {/* ① 今天好不好做 */}
       {}
       <BreadthPanel b={facts?.breadth} limitDown={facts?.loss_effect?.market_limit_down} />
+      <BoardTrafficLightPanel light={data.board_traffic_light} />
 
       {/* ② 昨天进去的人今天赚不赚钱 —— 用户说这是全页最有用的一块，所以提到第二位 */}
       <section className="space-y-4">
         <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-primary">
           昨天进去的人赚不赚钱 · Feedback
         </div>
-        <Matrix fm={facts?.feedback_matrix} />
+        <Matrix fm={facts?.feedback_matrix} date={data.target_date || data.trade_date || ""} />
         <div className="grid gap-4 md:grid-cols-2">
           <MoneyEffectCard me={em.me} />
           <LossEffectSection le={facts?.loss_effect} />
@@ -485,7 +494,7 @@ export function AgentReview() {
         </div>
         <div className="grid gap-4 md:grid-cols-3">
           <PromotionCard pr={em.pr} />
-          <LadderCard lg={em.lg} />
+          <LadderCard lg={em.lg} date={data.target_date || data.trade_date || ""} />
           <ConsecPremiumCard cp={em.cp} />
         </div>
         <SealQualitySection sq={facts?.seal_quality} />
@@ -495,7 +504,7 @@ export function AgentReview() {
           用户说这两块"在讲相近的事"，分开看要来回找 */}
       <section className="space-y-4">
         <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-primary">钱往哪去 · Themes</div>
-        <ThemeTreeView t={facts?.theme_tree} />
+        <ThemeTreeView t={facts?.theme_tree} status={data.iwencai_status} />
         <Themes ts={facts?.theme_structure} />
       </section>
 
@@ -514,7 +523,7 @@ export function AgentReview() {
           <StatsView c={facts?.stats_context} />
           <DiffView d={facts?.day_diff} />
         </div>
-        <CycleCard cy={em.cy} />
+        <CycleCard cy={em.cy} regime={data.emotion_regime} />
       </section>
 
       {/* AI 研判（放在事实之后）*/}
@@ -605,6 +614,13 @@ export function AgentReview() {
       )}
 
       {}
+
+      {data && <FollowupPanel
+        key={data.target_date || data.trade_date}
+        date={data.target_date || data.trade_date || ""}
+        onEditableChange={setFollowupEditable}
+      />}
+      {data && followupEditable && <p className="-mt-4 text-xs text-muted-foreground">次日跟踪名单仍可在开盘锁定前调整。</p>}
 
       {data && (
         <ReviewAgentChat
