@@ -554,11 +554,13 @@ def api_market_session():
     """
     today = china_today()
     quotes_of = trade_calendar.quote_trade_day()
+    latest_closed = trade_calendar.latest_session()
     is_today = bool(quotes_of) and quotes_of == today
     now = china_now()
     phase = trade_calendar.session_phase(now, quotes_of)
     return {"now": now.strftime("%Y-%m-%d %H:%M"), "today": today,
-            "quotes_of": quotes_of, "is_today": is_today, **phase}
+            "quotes_of": quotes_of, "latest_closed": latest_closed,
+            "is_today": is_today, **phase}
 
 
 @app.get("/api/market/live-emotion")
@@ -1372,6 +1374,44 @@ def api_journal_add(request: Request, body: dict = Body(...)):
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.post("/api/journal/import/preview")
+def api_journal_import_preview(request: Request, body: dict = Body(...)):
+    """OCR one screenshot locally and return an editable draft; never stores the image."""
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import journal_import
+
+    try:
+        return JSONResponse(journal_import.preview_image(
+            client_id=str(body.get("client_id") or ""),
+            mime_type=str(body.get("mime_type") or ""),
+            content_b64=body.get("content_b64"),
+        ))
+    except journal_import.JournalImageError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except journal_import.JournalOCRUnavailable as exc:
+        return JSONResponse({"error": str(exc), "ocr_unavailable": True}, status_code=503)
+
+
+@app.post("/api/journal/import/commit")
+def api_journal_import_commit(request: Request, body: dict = Body(...)):
+    """Atomically commit reviewed OCR drafts as new trades or appended fills."""
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import journal
+
+    try:
+        return JSONResponse(journal.commit_image_import(body.get("items")))
+    except journal.JournalImportConflict as exc:
+        return JSONResponse({"error": str(exc), "conflict": True}, status_code=409)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.post("/api/journal/update")
 def api_journal_update(request: Request, trade_id: str, body: dict = Body(...)):
     """更新一笔已有交易 —— 主要用来给持仓中的记录**补上后来的成交**。
@@ -2132,13 +2172,27 @@ async def _lifespan(_app: FastAPI):
     manager = ReviewAgentManager(ReviewAgentStore(_REVIEW_AGENT_ROOT), Path(_REVIEW_DIR),
                                  ReviewAgentRuntime(_REVIEW_AGENT_ROOT))
     from duanxian.followup_service import collector
+    from duanxian import anomaly_center, board_pattern_research, growth_ladders
     _app.state.review_agent = manager
     try:
         _start_intraday()
         _start_review_scheduler(manager)
         collector.start()
+        growth_ladders.start_worker()
+        anomaly_center.start_worker()
+        board_pattern_research.start_worker()
+        try:
+            pattern_dates = board_pattern_research.status().get("available_dates") or []
+            pattern_latest = trade_calendar.latest_session()
+            if pattern_latest and pattern_latest not in pattern_dates:
+                board_pattern_research.request_sync(pattern_latest)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ 剧本研究启动补漏检查失败：{type(exc).__name__}: {exc}")
         yield
     finally:
+        board_pattern_research.stop_worker()
+        anomaly_center.stop_worker()
+        growth_ladders.stop_worker()
         _stop_review_scheduler()
         collector.stop()
         manager.shutdown()

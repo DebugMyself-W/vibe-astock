@@ -34,7 +34,16 @@ def _isolate_reason_gateway(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
+    original_connect = socket.socket.connect
+
     def blocked(self, *args, **kwargs):
+        address = args[0] if args else kwargs.get("address")
+        host = address[0] if isinstance(address, tuple) and address else None
+        if host in {"127.0.0.1", "::1", "localhost"}:
+            # On Windows, asyncio implements socketpair() with a loopback TCP
+            # connection.  Starlette's in-process TestClient therefore needs
+            # loopback even though it never makes an outbound request.
+            return original_connect(self, *args, **kwargs)
         raise AssertionError(
             "测试期间不允许出站网络连接 —— 说明有数据源没被 patch，请补上 monkeypatch"
         )

@@ -56,6 +56,12 @@ const traffic = {
 };
 
 function response(pathname, params = new URLSearchParams()) {
+  if (pathname === "/api/market/limit-gene") return {
+    available: true, window_days: 259, from: "2025-08-13", to: "2026-08-27",
+    limit_up_count: 7, touched_limit_count: 10, seal_success_rate: .7,
+    recent_60_limit_count: 2, stock_character_score: 63,
+    source: "腾讯日K（未复权）", note: "涨停次数仅统计收盘封住涨停；盘中触板但收盘未封不计入。",
+  };
   if (pathname === "/api/market/board-traffic-light") return params.get("stock_mode") === "settled"
     ? { ...traffic, light: "yellow", label: "黄灯 · 高位观察", stocks: { "600001": settledStockLight } }
     : traffic;
@@ -137,6 +143,9 @@ function response(pathname, params = new URLSearchParams()) {
       await factorDialog.getByText("临板距离", { exact: true }).waitFor();
       await factorDialog.getByText("量比", { exact: true }).waitFor();
       await factorDialog.getByText("换手率", { exact: true }).waitFor();
+      await factorDialog.getByText("7 次", { exact: true }).waitFor();
+      await factorDialog.getByText("63 / 100", { exact: true }).waitFor();
+      await factorDialog.getByText("70.0%", { exact: true }).waitFor();
       await factorDialog.getByRole("button", { name: "关闭" }).click();
       assert.equal(await page.getByText("打板环境", { exact: true }).count(), 0, `${name} duplicate sticky summary remains`);
       await page.getByText("市场宽度与涨跌停统计", { exact: true }).waitFor();

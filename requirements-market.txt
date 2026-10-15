@@ -1,0 +1,5 @@
+# mootdx 0.11 declares an obsolete httpx<0.26 dependency which conflicts with
+# MCP 1.26.  The application only uses its TongdaXin TCP client, so setup
+# installs this optional market adapter without dependency resolution after the
+# compatible core environment has been installed.
+mootdx>=0.11

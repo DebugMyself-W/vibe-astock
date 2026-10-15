@@ -1,3 +1,5 @@
+import json
+
 from duanxian import stock_explorer as explorer
 
 
@@ -115,3 +117,36 @@ def test_intraday_defaults_to_confirmed_quote_day(monkeypatch):
     assert result["requested_date"] == "2026-09-18"
     assert set(result["series"]) == {"600001", "000002"}
     assert all(line["date"] == "2026-09-18" for line in result["series"].values())
+
+
+def test_bse_intraday_falls_back_to_eastmoney_when_tencent_is_empty(monkeypatch):
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    def open_fixture(request, timeout=10):
+        if "ifzq.gtimg.cn" in request.full_url:
+            return Response({"data": {"bj920157": {"m5": []}}})
+        assert "trends2/get" in request.full_url
+        assert "secid=0.920157" in request.full_url
+        return Response({"data": {"preClose": 67.26, "trends": [
+            "2026-10-14 09:30,66.00,66.10,66.00,120,792000.00,0",
+            "2026-10-14 15:00,60.00,63.17,60.00,1018,6106680.00,0",
+        ]}})
+
+    monkeypatch.setattr(explorer, "_urlopen", open_fixture)
+    result = explorer._minute_rows("920157", "2026-10-14", 1)
+
+    assert result["date"] == "2026-10-14"
+    assert result["source"] == "eastmoney_trends2"
+    assert result["points"][-1]["price"] == 60.0
+    assert result["points"][-1]["volume"] == 1018.0

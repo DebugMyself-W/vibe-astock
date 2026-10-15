@@ -424,6 +424,74 @@ def _urlopen(request: urllib.request.Request, timeout: int = 10):
         return urllib.request.urlopen(request, timeout=timeout)
 
 
+def _select_minute_days(code: str, parsed_rows: list[dict], date: str | None,
+                        days: int, source: str) -> dict:
+    requested = (date or "").replace("-", "")
+    available_days = sorted({
+        item["date"] for item in parsed_rows
+        if not requested or item["date"] <= requested
+    })
+    selected_days = set(available_days[-max(1, min(int(days or 1), 5)):])
+    parsed = []
+    for original in parsed_rows:
+        if original["date"] not in selected_days:
+            continue
+        item = dict(original)
+        day = item["date"]
+        item["date"] = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+        item["label"] = f"{day[4:6]}/{day[6:]} {item['time']}"
+        parsed.append(item)
+    actual_date = available_days[-1] if available_days else ""
+    return {
+        "code": code,
+        "date": (f"{actual_date[:4]}-{actual_date[4:6]}-{actual_date[6:]}"
+                 if len(actual_date) == 8 else None),
+        "points": parsed,
+        "source": source,
+    }
+
+
+def _eastmoney_minute_rows(code: str, date: str | None, days: int = 1) -> dict:
+    """Recent minute bars used only after Tencent returns no points.
+
+    Tencent's m5 endpoint currently returns an empty node for canonical BSE
+    920xxx symbols.  Eastmoney trends2 does cover those symbols (market 0) and
+    exposes up to five recent sessions.  Keeping this as a fallback preserves
+    the low-risk Tencent route for the rest of the market.
+    """
+    market = "1" if code.startswith(("5", "6", "9")) and not code.startswith("920") else "0"
+    query = urllib.parse.urlencode({
+        "secid": f"{market}.{code}", "ndays": str(max(1, min(int(days or 1), 5))),
+        "iscr": "0", "iscca": "0",
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f53,f54,f55,f56,f57,f58",
+    })
+    request = urllib.request.Request(
+        f"https://push2.eastmoney.com/api/qt/stock/trends2/get?{query}",
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+    )
+    with _urlopen(request, timeout=12) as response:
+        payload = json.loads(response.read().decode("utf-8", "ignore"))
+    rows = ((payload.get("data") or {}).get("trends") or [])
+    parsed_rows = []
+    for row in rows:
+        columns = str(row).split(",")
+        if len(columns) < 5:
+            continue
+        stamp = columns[0].strip()
+        try:
+            day, clock = stamp[:10].replace("-", ""), stamp[-5:]
+            if len(day) != 8:
+                continue
+            parsed_rows.append({
+                "date": day, "time": clock,
+                "price": float(columns[1]), "volume": float(columns[4]),
+            })
+        except (TypeError, ValueError):
+            continue
+    return _select_minute_days(code, parsed_rows, date, days, "eastmoney_trends2")
+
+
 def _minute_rows(code: str, date: str | None, days: int = 1) -> dict:
     symbol = _prefix(code) + code
     query = urllib.parse.urlencode({"param": f"{symbol},m5,,320"})
@@ -435,7 +503,6 @@ def _minute_rows(code: str, date: str | None, days: int = 1) -> dict:
         payload = json.loads(response.read().decode("utf-8"))
     node = (payload.get("data") or {}).get(symbol) or {}
     rows = node.get("m5") or []
-    requested = (date or "").replace("-", "")
     parsed_rows = []
     for row in rows:
         if not isinstance(row, list) or len(row) < 6:
@@ -453,22 +520,14 @@ def _minute_rows(code: str, date: str | None, days: int = 1) -> dict:
             })
         except (TypeError, ValueError):
             continue
-    # 腾讯 m5 一次会带回最近数日。历史复盘页可能请求的是其中某天，因此先截到
-    # 目标交易日，再按实际可用的交易日取最后 N 天，不能只按时间字符串硬过滤。
-    available_days = sorted({item["date"] for item in parsed_rows if not requested or item["date"] <= requested})
-    selected_days = set(available_days[-max(1, min(int(days or 1), 5)):])
-    parsed = []
-    for item in parsed_rows:
-        if item["date"] not in selected_days:
-            continue
-        day = item["date"]
-        item["date"] = f"{day[:4]}-{day[4:6]}-{day[6:]}"
-        # 多日分时必须保留日期，否则每日 09:30 的分类轴会相互覆盖。
-        item["label"] = f"{day[4:6]}/{day[6:]} {item['time']}"
-        parsed.append(item)
-    actual_date = available_days[-1] if available_days else ""
-    return {"code": code, "date": (f"{actual_date[:4]}-{actual_date[4:6]}-{actual_date[6:]}"
-                                            if len(actual_date) == 8 else None), "points": parsed}
+    if not parsed_rows and _prefix(code) == "bj":
+        try:
+            return _eastmoney_minute_rows(code, date, days)
+        except Exception:
+            # Preserve the primary empty result; _one_intraday still supplies
+            # previous_close and the UI can report genuine provider absence.
+            pass
+    return _select_minute_days(code, parsed_rows, date, days, "tencent_5m_kline")
 
 
 def _previous_close(code: str, date: str | None) -> float | None:
@@ -524,7 +583,9 @@ def intraday_series(codes: Iterable[str], date: str | None = None, days: int = 1
             except Exception as exc:  # noqa: BLE001
                 series[code] = {"code": code, "date": effective_date, "points": [],
                                 "reason": f"{type(exc).__name__}: {exc}"}
-    return {"requested_date": effective_date, "days": days, "series": series, "source": "tencent_5m_kline"}
+    sources = sorted({str(item.get("source")) for item in series.values() if item.get("source")})
+    source = sources[0] if len(sources) == 1 else ("mixed:" + ",".join(sources) if sources else "unavailable")
+    return {"requested_date": effective_date, "days": days, "series": series, "source": source}
 
 
 def reset_memory_for_tests() -> None:

@@ -307,6 +307,164 @@ export interface DragonTiger {
   seats: { buy: DtSeat[]; sell: DtSeat[] };
   institution: { buy_amt: number; sell_amt: number; net_amt: number };
 }
+export interface DragonTigerBranch {
+  seat_id: string; category: "institution" | "northbound" | "quant" | "hot_money" | "retail" | "brokerage";
+  name: string; buy_wan: number; sell_wan: number; net_wan: number;
+  ratio: number; tags: string[]; description: string;
+}
+export interface DragonTigerBoardStock {
+  code: string; name: string; close: number; change_pct: number; turnover_pct: number;
+  deal_wan: number; buy_wan: number; sell_wan: number; net_wan: number;
+  reasons: string[]; reason: string; concept: string | null; theme_reason: string | null;
+  board_label: string | null;
+  buy_branches: DragonTigerBranch[]; sell_branches: DragonTigerBranch[];
+}
+export interface DragonTigerBoardData {
+  available: boolean; date: string; total_records: number; total_stocks: number;
+  source: string; reason_note?: string | null; branch_note?: string | null;
+  stocks: DragonTigerBoardStock[];
+}
+export interface GrowthLadderStock {
+  code: string; name: string; industry: string; pct_chg: number; level: number;
+  eliminated: boolean; stage_high: boolean;
+}
+export interface GrowthLadderLevel { level: number; items: GrowthLadderStock[]; overflow: number }
+export interface GrowthLadderSync {
+  run_id?: string; state: "idle" | "queued" | "building" | "ready" | "failed";
+  phase: string; completed: number; total: number; percent: number;
+  started_at?: string; finished_at?: string; last_ready_date?: string | null;
+  available_dates: string[]; missing?: string[]; source_hits?: Record<string, number>; error?: string | null;
+}
+export interface GrowthLadderQuality {
+  universe_count: number; covered_count: number; missing_count: number; suspended_count: number;
+  source_hits: Record<string, number>; algorithm_version: string;
+}
+export interface GrowthLadderData {
+  available: boolean; date: string; live: boolean; updated_at: string;
+  rule: string; source: string; coverage: "full" | "building" | "unavailable" | "approximate";
+  note?: string; available_dates: string[]; levels: GrowthLadderLevel[];
+  quality: GrowthLadderQuality; sync: GrowthLadderSync;
+}
+export type AnomalyCoverage = "full" | "partial" | "unavailable";
+export interface AnomalyPrediction {
+  code: string; name: string; market: "SH" | "SZ" | "BJ"; board: string; industry: string;
+  price: number | null; current_pct: number; window_days: number; deviation: number | null;
+  required_pct: number | null; status: string; rule: string; reset_date?: string | null;
+  quote_time?: string | null; benchmark?: string; daily_limit?: number;
+  direction?: "up" | "down"; threshold?: number; progress_days?: number;
+  occurrence?: number; rule_code?: number; source?: string;
+}
+export interface AnomalyPredictions {
+  available: boolean; coverage: AnomalyCoverage; trade_date?: string | null; updated_at: string;
+  algorithm_version: string; note?: string | null;
+  groups: { next_day: AnomalyPrediction[]; same_day: AnomalyPrediction[]; triggered: AnomalyPrediction[] };
+  quality: { universe_count: number; history_covered: number; announcement_covered: number;
+    realtime_covered: number; missing_count: number; source_hits: Record<string, number>;
+    ineligible_count?: number;
+    prediction_source?: string; prediction_source_date?: string; prediction_rows?: number;
+    prediction_source_error?: string;
+    missing_reasons?: Record<string, number>;
+    missing_samples?: Array<{ code: string; name?: string | null; reason: string }> };
+}
+export interface AnomalyMonitor {
+  code: string; name: string; market: "SH" | "SZ" | "BJ"; type: "risk_warning" | "severe_abnormal";
+  type_label: string; start?: string; end?: string; remaining_days?: number | null; reason: string;
+  announcement_date?: string; link?: string; rule?: string;
+}
+export interface AnomalyMonitors {
+  available: boolean; coverage: AnomalyCoverage; counts: { all: number; risk_warning: number; severe_abnormal: number };
+  items: AnomalyMonitor[]; pagination: { page: number; page_size: number; total: number; pages: number };
+  errors: string[]; updated_at: string;
+}
+export interface AnomalySearchItem { code: string; name: string; market: string; industry: string; is_st: number }
+export interface AnomalyCalculation {
+  available: boolean; trade_date: string;
+  stock: { code: string; name: string; market: string; board: string; industry: string; price: number | null; current_pct: number };
+  benchmark: { code: string; name: string };
+  general_rule: { threshold: number; same_direction_count: number };
+  severe_rules: Array<{ window_days: number; threshold: number; direction: "up" | "down"; rule: string;
+    deviation: number | null; required_today: number | null; required_next: number | null; triggered: boolean }>;
+  events: Array<{ event_date: string; kind: string; rule_code: string; announcement_date: string; reset_date: string; url: string; source: string }>;
+  disclaimer: string; algorithm_version: string;
+}
+export interface AnomalySync {
+  state: "idle" | "queued" | "running" | "complete" | "failed"; phase: string; completed: number; total: number;
+  progress: number; started_at?: string | null; finished_at?: string | null; error?: string | null;
+  trade_date?: string | null; latest_success_date?: string | null; updated_at?: string | null;
+}
+export type BoardPatternMode = "close" | "intraday";
+export type BoardPatternAlgorithm = "v1" | "v2";
+export interface BoardPatternEvent {
+  event_date: string; code: string; name: string; market: "SH" | "SZ" | "BJ";
+  industry: string; theme: string; status: "sealed" | "confirmed_break" | "temporary_break";
+  board_height: number; board_type: string; path: string[];
+  open?: number | null; high?: number | null; low?: number | null; close?: number | null;
+  prev_close?: number | null; pct_chg?: number | null; volume?: number | null; amount?: number | null;
+  turnover_pct?: number | null; float_mcap?: number | null; first_seal?: string; break_times?: number;
+  matching_eligible?: boolean; matching_note?: string;
+}
+export interface BoardPatternSync {
+  state: "idle" | "queued" | "running" | "ready" | "failed"; phase: string;
+  completed: number; total: number; progress: number; missing?: string[];
+  source_hits?: Record<string, number>; available_dates: string[];
+  latest_success_date?: string | null; error?: string | null;
+  quality?: {
+    required_dates: number; corpus_required_dates?: number; universe_ready_dates?: number;
+    bars_ready_dates?: number; snapshot_ready_dates?: number; unknown_gap_count?: number;
+    canonical_instrument_count?: number; invalid_directory_count?: number;
+    alias_merged_count?: number; lifecycle_excluded_count?: number; updated_at?: string | null;
+    source_hits?: Record<string, number>; algorithm_version?: string;
+  };
+  failure_summary?: {
+    retriable_count: number; deterministic_count: number; categories?: Record<string, number>;
+    samples: Array<{ trade_date: string; phase: string; source: string; error_type: string;
+      category?: string; message: string; retriable: number | boolean; attempts: number }>;
+  };
+}
+export interface BoardPatternEvents {
+  available: boolean; coverage: "full" | "building" | "unavailable"; matching_available: boolean;
+  date: string; mode: BoardPatternMode; anchor_time: string; algorithm_version: string;
+  events: BoardPatternEvent[];
+  groups: Array<{ key: string; label: string; count: number; items: BoardPatternEvent[] }>;
+  available_dates: string[]; note?: string;
+  intraday_window: {
+    available: boolean; date: string; opens_at: string; closes_at: string;
+    quote_day?: string | null; reason: string;
+  };
+  quality: { event_count: number; source_hits: Record<string, number>; history_sessions: number; required_sessions: number;
+    required_dates?: number; corpus_required_dates?: number; universe_ready_dates?: number;
+    bars_ready_dates?: number; snapshot_ready_dates?: number; unknown_gap_count?: number;
+    canonical_instrument_count?: number; invalid_directory_count?: number;
+    alias_merged_count?: number; lifecycle_excluded_count?: number; updated_at?: string | null;
+    algorithm_version?: string };
+  sync: BoardPatternSync;
+}
+export interface BoardPatternSearchItem {
+  code: string; name: string; industry: string; status: BoardPatternEvent["status"];
+  board_height: number; board_type: string;
+}
+export interface BoardPatternBar {
+  date: string; open: number; high: number; low: number; close: number;
+  pct_chg?: number | null; volume?: number | null; amount?: number | null; turnover_pct?: number | null;
+}
+export interface BoardPatternCase {
+  code: string; name: string; event_date: string; industry: string; theme: string;
+  status: BoardPatternEvent["status"]; board_height: number; board_type: string; path: string[];
+  scores: { identity: number; path: number; volume_price: number; liquidity: number; environment: number; total: number; path_suffix: number; exact_path: boolean };
+  result: { t1: number | null; t3: number | null; t1_high: number | null; t1_pct: number | null; label: string };
+  chart: BoardPatternBar[];
+}
+export interface BoardPatternResult {
+  available: boolean; coverage: string; matching_available: boolean; date: string;
+  mode: BoardPatternMode; anchor_time: string; algorithm: BoardPatternAlgorithm; algorithm_version: string;
+  target: BoardPatternEvent & { chart: BoardPatternBar[] };
+  stats: { sample_count: number; complete_path_count: number; next_red_rate: number | null;
+    next_avg_high: number | null; next_close_median: number | null; next_close_mean: number | null;
+    next_limit_up: number; next_limit_down: number };
+  cases: BoardPatternCase[]; candidate_count: number;
+  scripts: Array<{ title: string; detail: string }>; warnings: string[];
+  quality: BoardPatternEvents["quality"]; disclaimer: string;
+}
 export interface LockupRow { date: string; type: string; shares: number | null; able_shares: number | null; ratio: number | null }
 export interface UnlockCalendar { start: string; end: string; fetched_at: string; truncated: boolean; events: (LockupRow & { code: string; name: string })[] }
 export interface Lockup { history: LockupRow[]; upcoming: LockupRow[] }
@@ -344,6 +502,8 @@ export interface MarketSession {
   today: string;
   /** 实时行情代表的交易日；取不到时为 null */
   quotes_of: string | null;
+  /** 最近一个已经收盘、可用于复盘页面的真实交易日 */
+  latest_closed: string | null;
   is_today: boolean;
   poll?: boolean;
   phase_key?: string;
@@ -514,6 +674,7 @@ export const api = {
     return get<BoardTrafficLight>(`/market/board-traffic-light${query ? `?${query}` : ""}`);
   },
   limitBreakAlerts: (codes: string[]) => get<LimitBreakAlerts>(`/market/limit-break-alerts?codes=${encodeURIComponent(codes.join(","))}`),
+  limitGene: (code: string) => get<LimitGene>(`/market/limit-gene?code=${encodeURIComponent(code)}`),
   monitorSnapshot: async (watch: string) => {
     const codes = watch.split(',').filter(Boolean);
     const monitored = codes.slice(0, 100).join(',');
@@ -531,6 +692,31 @@ export const api = {
     return {...snapshot, watch_warning: monitorWarning || (codes.length > 100 ? '已有自选超过100只，本页仅监控前100只；原列表保留，可在持仓自选中整理' : undefined)};
   },
   firstBoard: (date?: string) => get<FirstBoardData>(`/market/first-board${date ? `?date=${encodeURIComponent(date)}` : ""}`),
+  dragonTigerBoard: (date?: string) => get<DragonTigerBoardData>(`/market/dragon-tiger-board${date ? `?date=${encodeURIComponent(date)}` : ""}`),
+  growthLadderYang: (date?: string) => get<GrowthLadderData>(`/market/growth-ladders/yang${date ? `?date=${encodeURIComponent(date)}` : ""}`),
+  growthLadderStatus: () => get<GrowthLadderSync>("/market/growth-ladders/yang/status"),
+  syncGrowthLadder: (date?: string) => request<GrowthLadderSync>(`/market/growth-ladders/yang/sync${date ? `?date=${encodeURIComponent(date)}` : ""}`, "POST"),
+  anomalyPredictions: (date?: string) => get<AnomalyPredictions>(`/market/anomaly-center/predictions${date ? `?date=${encodeURIComponent(date)}` : ""}`),
+  anomalyMonitors: (type: "all" | "risk_warning" | "severe_abnormal" = "all", page = 1, pageSize = 20) =>
+    get<AnomalyMonitors>(`/market/anomaly-center/monitors?type=${type}&page=${page}&page_size=${pageSize}`),
+  anomalySearch: (query: string) => get<AnomalySearchItem[]>(`/market/anomaly-center/search?q=${encodeURIComponent(query)}`),
+  anomalyCalculate: (code: string) => get<AnomalyCalculation>(`/market/anomaly-center/calculate?code=${encodeURIComponent(code)}`),
+  anomalyStatus: () => get<AnomalySync>("/market/anomaly-center/status"),
+  syncAnomalyCenter: (date?: string) => request<AnomalySync>(`/market/anomaly-center/sync${date ? `?date=${encodeURIComponent(date)}` : ""}`, "POST"),
+  boardPatternEvents: (mode: BoardPatternMode, date?: string) => {
+    const params = new URLSearchParams({ mode });
+    if (date) params.set("date", date);
+    return get<BoardPatternEvents>(`/market/board-pattern-research/events?${params}`);
+  },
+  boardPatternSearch: (query: string, mode: BoardPatternMode, date?: string) => {
+    const params = new URLSearchParams({ q: query, mode });
+    if (date) params.set("date", date);
+    return get<BoardPatternSearchItem[]>(`/market/board-pattern-research/search?${params}`);
+  },
+  boardPatternCalculate: (body: { code: string; mode: BoardPatternMode; algorithm: BoardPatternAlgorithm; date?: string }) =>
+    request<BoardPatternResult>("/market/board-pattern-research/calculate", "POST", body),
+  boardPatternStatus: () => get<BoardPatternSync>("/market/board-pattern-research/status"),
+  syncBoardPattern: (date?: string) => request<BoardPatternSync>(`/market/board-pattern-research/sync${date ? `?date=${encodeURIComponent(date)}` : ""}`, "POST"),
   turnoverTop: () => get<TurnoverTop>("/market/turnover-top"),
   globalIndices: () => get<GlobalIndex[]>("/global/indices"),
   globalStock: (symbol: string) => get<GlobalStock>(`/global/stock?symbol=${encodeURIComponent(symbol)}`),

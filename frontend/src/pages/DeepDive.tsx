@@ -20,6 +20,14 @@ type DeepDiveReportSummary = {
 };
 type DeepDiveHistory = { total: number; reports: DeepDiveReportSummary[] };
 type DeepDiveDeleteResult = DeepDiveHistory & { deleted_job_id: string; latest_job_id: string };
+type TaskFeedback = {
+  status: "submitting" | "running" | "failed" | "cancelled" | "complete" | "recovering";
+  target: string;
+  stage: string;
+  message: string;
+  elapsed: number;
+  jobId: string;
+};
 
 export function DeepDive() {
   const workspace = useWorkspace();
@@ -37,6 +45,7 @@ export function DeepDive() {
   const [msg, setMsg] = useState("");
   const [stage, setStage] = useState("");
   const [jobId, setJobId] = useState("");
+  const [taskFeedback, setTaskFeedback] = useState<TaskFeedback | null>(null);
   const [recovery, setRecovery] = useState(false);
   const [loadingLatest, setLoadingLatest] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -45,6 +54,8 @@ export function DeepDive() {
   const [deletingReportId, setDeletingReportId] = useState("");
   const [history, setHistory] = useState<DeepDiveHistory>({ total: 0, reports: [] });
   const polling = useRef(false);
+  const pollRevision = useRef(0);
+  const taskStock = useRef("");
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const alive = useRef(true);
   const displayRevision = useRef(0);
@@ -71,7 +82,7 @@ export function DeepDive() {
   async function showLatest() {
     target.current = "";
     sessionStorage.removeItem(acceptedKey);
-    setLoadingLatest(true); setMsg("");
+    setTaskFeedback(null); setStage(""); setLoadingLatest(true); setMsg("");
     try { await loadLatest(true); }
     finally { if (alive.current) setLoadingLatest(false); }
   }
@@ -96,6 +107,7 @@ export function DeepDive() {
       const loaded = await agentRequest<DeepDiveData>(`/deepdive/reports/${report.job_id}`);
       if (alive.current && revision === displayRevision.current) {
         setData(loaded); setSection("summary"); setHistoryOpen(false);
+        setTaskFeedback(null); setStage("");
         if (loaded.code) setStock(loaded.code);
         setMsg(`已加载历史报告：${loaded.name || loaded.code}（${loaded.code}）· ${loaded.generated_at || report.generated_at}`);
       }
@@ -134,24 +146,47 @@ export function DeepDive() {
     }
   }
 
-  async function pollOnce() {
+  async function pollOnce(revision = pollRevision.current) {
     if (!alive.current) return;
     try {
       const st = await agentRequest<Job>(`/deepdive${target.current ? `?job_id=${target.current}` : ""}`);
-      if (!alive.current) return;
+      if (!alive.current || revision !== pollRevision.current) return;
       if (st.job_id && !target.current) { target.current = st.job_id; sessionStorage.setItem(acceptedKey, st.job_id); }
-      setJobId(st.job_id || ""); setElapsed(st.elapsed || 0); setStage(st.stage || "");
+      const status = st.status || (st.running ? "running" : "idle");
+      const currentTarget = st.stock || taskStock.current;
+      if (currentTarget) taskStock.current = currentTarget;
+      setJobId(st.job_id || ""); setElapsed(st.elapsed || 0); setStage(st.running ? (st.stage || "") : "");
       setRunning(Boolean(st.running)); polling.current = Boolean(st.running);
-      if (st.running) { timer.current = setTimeout(pollOnce, 1500); return; }
+      if (st.running) {
+        setTaskFeedback({ status: "running", target: currentTarget, stage: st.stage || "任务运行中", message: "", elapsed: st.elapsed || 0, jobId: st.job_id || "" });
+        timer.current = setTimeout(() => void pollOnce(revision), 1500);
+        return;
+      }
       if (st.job_id && st.status === "complete") {
         const revision = ++displayRevision.current;
         const report = await agentRequest<DeepDiveData>(`/deepdive/reports/${st.job_id}`);
         if (alive.current && revision === displayRevision.current) setData(report);
       }
-      if (alive.current) setMsg(st.error || st.state_warning || "");
+      if (!alive.current || revision !== pollRevision.current) return;
+      if (status === "failed" || status === "cancelled" || status === "complete") {
+        setTaskFeedback({
+          status,
+          target: currentTarget,
+          stage: st.stage || "",
+          message: st.error || st.state_warning || (status === "complete" ? "报告已生成并保存" : "任务已停止"),
+          elapsed: st.elapsed || 0,
+          jobId: st.job_id || "",
+        });
+      }
+      setMsg(status === "failed" || status === "cancelled" ? "" : (st.state_warning || ""));
     } catch {
+      if (revision !== pollRevision.current) return;
       polling.current = false;
-      if (alive.current) { setRunning(false); setMsg("状态读取失败；任务可能仍在进行，请恢复查询，勿重新生成"); setRecovery(true); }
+      if (alive.current) {
+        const message = "状态读取失败；任务可能仍在进行，请恢复查询，勿重新生成";
+        setRunning(false); setMsg(""); setRecovery(true);
+        setTaskFeedback({ status: "recovering", target: taskStock.current, stage: stage || "状态读取", message, elapsed, jobId });
+      }
     }
   }
 
@@ -166,7 +201,10 @@ export function DeepDive() {
   }, []);
 
   async function deepdive(retry = false) {
-    if (polling.current) return;
+    if (polling.current) {
+      setMsg("已有多空辩论任务正在读取状态，请等待当前任务完成或先取消");
+      return;
+    }
     let body: Pending;
     if (retry) {
       try { body = JSON.parse(sessionStorage.getItem(pendingKey) || "null"); }
@@ -180,22 +218,37 @@ export function DeepDive() {
       try { sessionStorage.setItem(pendingKey, JSON.stringify(body)); }
       catch { setMsg("无法保存任务恢复标识，未发起深挖"); return; }
     }
-    polling.current = true; setRunning(true); setMsg("");
+    const revision = ++pollRevision.current;
+    if (timer.current) clearTimeout(timer.current);
+    target.current = "";
+    sessionStorage.removeItem(acceptedKey);
+    taskStock.current = body.stock;
+    polling.current = true; setRunning(true); setRecovery(false); setHistoryOpen(false); setMsg("");
+    setStage("正在提交任务");
+    setTaskFeedback({ status: "submitting", target: body.stock, stage: "正在提交任务", message: "", elapsed: 0, jobId: "" });
     try {
       const st = await agentRequest<Job>("/deepdive", body);
+      if (!alive.current || revision !== pollRevision.current) return;
       if (st.job_id) { target.current = st.job_id; sessionStorage.setItem(acceptedKey, st.job_id); }
       sessionStorage.removeItem(pendingKey);
-      if (!alive.current) return;
       setRecovery(false); setJobId(st.job_id || "");
-      await pollOnce();
+      await pollOnce(revision);
     } catch (error) {
+      if (revision !== pollRevision.current) return;
       polling.current = false;
       if (error instanceof AgentRequestError && error.status >= 400 && error.status < 500) {
         sessionStorage.removeItem(pendingKey);
-        if (alive.current) { setRunning(false); setRecovery(false); setMsg(error.message); }
+        if (alive.current) {
+          setRunning(false); setRecovery(false); setMsg(""); setStage("");
+          setTaskFeedback({ status: "failed", target: body.stock, stage: "提交任务", message: error.message, elapsed: 0, jobId: "" });
+        }
         return;
       }
-      if (alive.current) { setRunning(false); setRecovery(true); setMsg(`${error instanceof Error ? error.message : "响应中断"}；可用同一请求恢复，避免重复调用`); }
+      if (alive.current) {
+        const message = `${error instanceof Error ? error.message : "响应中断"}；可用同一请求恢复，避免重复调用`;
+        setRunning(false); setRecovery(true); setMsg(""); setStage("");
+        setTaskFeedback({ status: "recovering", target: body.stock, stage: "提交任务", message, elapsed: 0, jobId: "" });
+      }
     }
   }
 
@@ -214,6 +267,10 @@ export function DeepDive() {
   const reportContext = data ? `当前选中报告：${data.name}（${data.code}），生成于${data.generated_at}。章节：${section}。\n`
     + plainSection.slice(0,7500) + (plainSection.length>7500 ? '\n[本节仅提供前7500字，后续内容未进入本次问答]' : '') : '';
   const v = data?.verdict;
+  const taskStopped = taskFeedback?.status === "failed" || taskFeedback?.status === "cancelled";
+  const taskActive = taskFeedback?.status === "submitting" || taskFeedback?.status === "running" || taskFeedback?.status === "recovering";
+  const showingPreviousReport = Boolean(data && taskFeedback && (taskActive || taskStopped)
+    && (!taskFeedback.jobId || data.job_id !== taskFeedback.jobId));
 
   return (
     <div className="space-y-6">
@@ -238,7 +295,23 @@ export function DeepDive() {
         </div>
       </div>
 
-      <p className="text-xs text-muted-foreground">本次任务使用已保存的 AI 来源获取公开资料并执行四维分析与辩论，不改变首页 Agent 开关。{stage && `当前阶段：${stage}`}</p>
+      <p className="text-xs text-muted-foreground">本次任务使用已保存的 AI 来源获取公开资料并执行四维分析与辩论，不改变首页 Agent 开关。{running && stage && `当前阶段：${stage}`}</p>
+      {taskFeedback && taskFeedback.status !== "complete" && (
+        <div
+          role={taskStopped ? "alert" : "status"}
+          aria-live={taskStopped ? "assertive" : "polite"}
+          className={`rounded-xl border px-4 py-3 text-sm ${taskStopped ? "border-danger/35 bg-danger/10 text-danger" : taskFeedback.status === "recovering" ? "border-warning/35 bg-warning/10 text-warning" : "border-primary/30 bg-primary/5 text-foreground"}`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <b>{taskFeedback.target || "本次任务"} {taskFeedback.status === "failed" ? "多空辩论失败" : taskFeedback.status === "cancelled" ? "多空辩论已取消" : taskFeedback.status === "recovering" ? "任务状态待恢复" : "多空辩论进行中"}</b>
+            {taskFeedback.elapsed > 0 && <span className="text-xs opacity-75">耗时 {taskFeedback.elapsed}s</span>}
+          </div>
+          <p className="mt-1 text-xs leading-5 opacity-90">
+            {taskStopped ? `停止阶段：${taskFeedback.stage || "未记录"}` : `当前阶段：${taskFeedback.stage || "正在准备"}`}
+            {taskFeedback.message && ` · ${taskFeedback.message}`}
+          </p>
+        </div>
+      )}
       {!running && <div className="flex flex-wrap items-center gap-2">
         <button aria-label="历史辩论报告" disabled={historyLoading} onClick={() => void toggleHistory()} className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm disabled:opacity-50">
           {historyLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <History className="h-4 w-4" />}
@@ -271,6 +344,9 @@ export function DeepDive() {
       {running && <button onClick={cancel} className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm"><Square size={14} />取消本次深挖</button>}
       {recovery && !running && <button onClick={() => deepdive(true)} className="rounded-lg border border-border px-3 py-2 text-sm">恢复本次请求 / 查询状态</button>}
       {msg && <div className="glass rounded-xl px-4 py-3 text-sm text-muted-foreground">{msg}</div>}
+      {showingPreviousReport && <div className="rounded-xl border border-warning/30 bg-warning/5 px-4 py-3 text-sm text-warning">
+        下方仍是上一份已完成报告：{data?.name || data?.code}（{data?.code}）；它不是 {taskFeedback?.target} 的本次结果。
+      </div>}
 
       {!data && !running && (
         <div className="glass rounded-2xl py-16 text-center text-muted-foreground">

@@ -11,8 +11,16 @@ from .evidence import EvidenceError, digest
 
 
 class FrozenStockInputs:
-    def __init__(self, directory, check):
-        self.directory, self.check, self.values = directory, check, {}
+    _STAGES = {
+        "resolve": "解析标的",
+        "get_profile": "读取实时行情",
+        "get_theme": "读取题材资料",
+        "get_lhb": "读取龙虎榜资料",
+        "get_kline": "读取历史行情",
+    }
+
+    def __init__(self, directory, check, progress=lambda _stage: None):
+        self.directory, self.check, self.progress, self.values = directory, check, progress, {}
 
     def __getattr__(self, name):
         if name not in {"resolve", "get_profile", "get_theme", "get_lhb", "get_kline"}:
@@ -22,7 +30,12 @@ class FrozenStockInputs:
             key = name + ":" + digest(args)
             if key not in self.values:
                 from .public_worker import fetch_public
-                value = fetch_public(name, list(args), self.directory, self.check)
+                stage = self._STAGES[name]
+                self.progress(stage)
+                try:
+                    value = fetch_public(name, list(args), self.directory, self.check)
+                except EvidenceError as exc:
+                    raise EvidenceError(f"{stage}失败：{exc}") from None
                 self.check()
                 record = {"input": name, "args": args, "value": value, "fetched_at": time.time()}
                 record["sha256"] = digest(record)
@@ -90,7 +103,7 @@ class DeepDive(Daily):
         try:
             directory = self.directory / self.current["job_id"]
             directory.mkdir(mode=0o700)
-            inputs = FrozenStockInputs(directory, check)
+            inputs = FrozenStockInputs(directory, check, lambda stage: self._update(stage=stage))
             date = china_today()
             llm = DailyLLM(self.manager.runtime, source, key, directory, date, self.cancel_event, check, purpose="stock")
             final = run(stock, date, llm=llm, data_source=inputs, check=check, pack=RESEARCH_PACK,

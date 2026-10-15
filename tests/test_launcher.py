@@ -14,10 +14,18 @@ from scripts import manage
 REAL_CONNECT = socket.socket.connect
 
 
-def test_restart_fails_fast_when_agent_dependency_is_missing():
+def test_restart_repairs_updated_python_dependencies_before_launch():
     source = Path("restart.sh").read_text(encoding="utf-8")
-    assert "-c 'import mcp'" in source
+    assert "import mcp, rapidocr, onnxruntime, PIL" in source
+    assert '-m pip install -r "${ROOT_DIR}/requirements.txt"' in source
     assert "Run scripts/setup after updating the source" in source
+
+
+def test_restart_allows_slow_wsl_startup_without_hiding_an_exit():
+    source = Path("restart.sh").read_text(encoding="utf-8")
+    assert 'STARTUP_TIMEOUT="${VIBE_STARTUP_TIMEOUT:-60}"' in source
+    assert "attempt <= STARTUP_TIMEOUT" in source
+    assert 'kill -0 "${new_pid}"' in source
 
 
 def test_core_requirements_keep_mcp_installable():

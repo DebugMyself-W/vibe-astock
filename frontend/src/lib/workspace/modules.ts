@@ -3,13 +3,15 @@ import { Home, Radio, Swords, Eye, LineChart, Briefcase, FlaskConical } from 'lu
 export const MODULES = [
   { title: '首页', to: '/', icon: Home, pages: [{ to: '/', title: '首页' }] },
   { title: '盯盘', to: '/daily-review', icon: Eye, pages: [
-    { to: '/daily-review', title: '盘面数据' }, { to: '/watch', title: '实时动态' },
+    { to: '/daily-review', title: '盘面数据' }, { to: '/watch', title: '实时动态' }, { to: '/anomaly-center', title: '监管异动' },
+    { to: '/board-pattern-research', title: '剧本研究' },
     { to: '/yesterday-ladder', title: '昨日梯队' }, { to: '/agent/intraday', title: '盘中核验' },
     { to: '/today-validation', title: '今日验证' },
   ] },
   { title: '复盘', to: '/agent/review', icon: Swords, pages: [
     { to: '/agent/review', title: '复盘报告' }, { to: '/first-board', title: '首板分析' },
-    { to: '/heat', title: '近5天热度' }, { to: '/backtest', title: '历史统计' },
+    { to: '/dragon-tiger-board', title: '龙虎榜' }, { to: '/growth-ladders', title: '更多天梯' }, { to: '/heat', title: '近5天热度' },
+    { to: '/backtest', title: '历史统计' },
   ] },
   { title: '资讯雷达', to: '/intel', icon: Radio, pages: [{ to: '/intel', title: '资讯雷达' }] },
   { title: '个股研究', to: '/stock-data', icon: LineChart, pages: [
@@ -33,6 +35,10 @@ const CHAT_PAGES: Record<string, string> = {
   '/notes': '研究记录',
   '/': '首页', '/intel': '资讯雷达', '/agent/review': '复盘看板',
   '/daily-review': '盘面数据', '/first-board': '首板分析', '/heat': '近5天热度',
+  '/dragon-tiger-board': '龙虎榜',
+  '/growth-ladders': '更多天梯',
+  '/anomaly-center': '监管异动',
+  '/board-pattern-research': '剧本研究',
   '/backtest': '涨停样本统计', '/watch': '盯盘', '/agent/intraday': '盘中核验',
   '/stock-data': '个股数据', '/agent/deepdive': '个股深挖',
   '/portfolio': '持仓股', '/watchlist': '自选股', '/journal': '交易日志',

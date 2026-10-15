@@ -2,15 +2,25 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import * as echarts from "echarts";
 import type { EChartsOption } from "echarts";
-import { ChevronDown, ExternalLink, LineChart, Loader2, X } from "lucide-react";
+import { ChevronDown, ExternalLink, LineChart, Loader2, Star, X } from "lucide-react";
 import { StockConceptCard } from "@/components/StockConceptCard";
-import { api, type Blocks, type HotConcept, type IndustryPeer, type IndustryPeers, type IntradayBundle, type KlineRow, type Quote } from "@/lib/api";
+import { StockLink } from "@/components/ui/StockLink";
+import { api, type Blocks, type HotConcept, type IndustryPeer, type IndustryPeers, type IntradayBundle, type KlineRow, type MarketSession, type Quote } from "@/lib/api";
 import { agentFetch, finite, safeArray, type LadderDetails, type LadderStock } from "@/lib/agent";
 import { cn } from "@/lib/utils";
 import { pctColor } from "@/lib/colors";
+import { loadWatch, saveWatch } from "@/lib/watchlist";
 
 
 const LINE_COLORS = ["#ea580c", "#2563eb", "#16a34a", "#a855f7", "#0891b2", "#ca8a04"];
+const LATEST_INTRADAY_PHASES = new Set(["auction", "wait", "open", "break", "closing", "closed"]);
+const LIVE_INTRADAY_REFRESH_MS = 15_000;
+
+export function shouldUseLatestIntraday(session: MarketSession | null): boolean {
+  // 收盘后腾讯分时已经是当日完整行情，仍应优先于页面携带的昨日复盘日期。
+  // 盘前 quote_trade_day 会指向上一交易日，is_today=false，因此不会误把昨收标成今日。
+  return Boolean(session?.is_today && session.phase_key && LATEST_INTRADAY_PHASES.has(session.phase_key));
+}
 
 const industryPeersCache = new Map<string, IndustryPeers>();
 const industryPeersRequests = new Map<string, Promise<IndustryPeers>>();
@@ -77,11 +87,15 @@ function yi(value?: number | null) {
 }
 
 
-function Chart({ option, className, onSeriesClick }: { option: EChartsOption; className: string; onSeriesClick?: (seriesId: string) => void }) {
+function Chart({ option, className, onSeriesClick, onPointerIndex, testId }: {
+  option: EChartsOption; className: string; onSeriesClick?: (seriesId: string) => void;
+  onPointerIndex?: (index: number | null) => void; testId?: string;
+}) {
   const root = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!root.current) return;
-    const chart = echarts.init(root.current);
+    const node = root.current;
+    const chart = echarts.init(node);
     chart.setOption(option, true);
     if (onSeriesClick) {
       chart.on("click", (params) => {
@@ -89,11 +103,43 @@ function Chart({ option, className, onSeriesClick }: { option: EChartsOption; cl
         if (params.componentType === "series" && seriesId) onSeriesClick(seriesId);
       });
     }
+    if (onPointerIndex) {
+      const axes = (Array.isArray(option.xAxis) ? option.xAxis : [option.xAxis]) as Array<{ data?: unknown[] } | undefined>;
+      const categories = (axes[0]?.data || []).map((value) => String(value));
+      const clearPointer = () => onPointerIndex(null);
+      const movePointer = (event: MouseEvent) => {
+        const rect = node.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        if (!categories.length || !Number.isFinite(x)) {
+          clearPointer();
+          return;
+        }
+        const firstPixel = Number(chart.convertToPixel({ xAxisIndex: 0 }, 0));
+        const lastPixel = Number(chart.convertToPixel({ xAxisIndex: 0 }, categories.length - 1));
+        if (!Number.isFinite(firstPixel) || !Number.isFinite(lastPixel) || firstPixel === lastPixel) {
+          clearPointer();
+          return;
+        }
+        const index = Math.max(0, Math.min(categories.length - 1,
+          Math.round((x - firstPixel) / (lastPixel - firstPixel) * (categories.length - 1))));
+        onPointerIndex(index);
+      };
+      node.addEventListener("mousemove", movePointer);
+      node.addEventListener("mouseleave", clearPointer);
+      const observer = new ResizeObserver(() => chart.resize());
+      observer.observe(node);
+      return () => {
+        node.removeEventListener("mousemove", movePointer);
+        node.removeEventListener("mouseleave", clearPointer);
+        observer.disconnect();
+        chart.dispose();
+      };
+    }
     const observer = new ResizeObserver(() => chart.resize());
-    observer.observe(root.current);
+    observer.observe(node);
     return () => { observer.disconnect(); chart.dispose(); };
-  }, [option, onSeriesClick]);
-  return <div ref={root} className={className} />;
+  }, [option, onSeriesClick, onPointerIndex]);
+  return <div ref={root} className={className} data-testid={testId} />;
 }
 
 
@@ -237,46 +283,82 @@ function MiniDailyK({ code }: { code: string }) {
 }
 
 
-function StockModal({ stock, quoteDate, onClose }: { stock: Pick<LadderStock, "code" | "name" | "industry"> | IndustryPeer; quoteDate?: string | null; onClose: () => void }) {
+export function StockModal({ stock, quoteDate, onClose, initialChartTab = "minute", warning }: { stock: Pick<LadderStock, "code" | "name" | "industry"> | IndustryPeer; quoteDate?: string | null; onClose: () => void; initialChartTab?: "minute" | "daily"; warning?: { title: string; detail: string } }) {
   const [quote, setQuote] = useState<Quote | null>(null);
   const [minute, setMinute] = useState<IntradayBundle | null>(null);
   const [daily, setDaily] = useState<KlineRow[]>([]);
   const [blocks, setBlocks] = useState<Blocks | null>(null);
   const [hotConcepts, setHotConcepts] = useState<HotConcept[]>([]);
-  const [chartTab, setChartTab] = useState<"minute" | "daily">("minute");
+  const [chartTab, setChartTab] = useState<"minute" | "daily">(initialChartTab);
   const [intradayDays, setIntradayDays] = useState(1);
   const [intradayMenu, setIntradayMenu] = useState(false);
   const [minuteLoading, setMinuteLoading] = useState(true);
+  const [marketSession, setMarketSession] = useState<MarketSession | null>(null);
+  const [latestIntraday, setLatestIntraday] = useState(false);
   const [contentTab, setContentTab] = useState<"market" | "concept">("market");
   const [selectedConcept, setSelectedConcept] = useState<string | null>(null);
   const [conceptPeers, setConceptPeers] = useState<IndustryPeers | null>(null);
   const [conceptLoading, setConceptLoading] = useState(false);
   const [conceptDetail, setConceptDetail] = useState<IndustryPeer | null>(null);
   const [loading, setLoading] = useState(true);
+  const [dailyError, setDailyError] = useState("");
+  const [reloadKey, setReloadKey] = useState(0);
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [watched, setWatched] = useState(() => loadWatch().includes(stock.code));
+  useEffect(() => setWatched(loadWatch().includes(stock.code)), [stock.code]);
   useEffect(() => {
     let active = true;
-    setLoading(true); setBlocks(null); setHotConcepts([]); setSelectedConcept(null);
+    setLoading(true); setDailyError(""); setBlocks(null); setHotConcepts([]); setSelectedConcept(null);
     Promise.allSettled([
       api.quote(stock.code), api.kline(stock.code), api.blocks(stock.code), api.hotConcepts(stock.code),
     ]).then((results) => {
       if (!active) return;
       if (results[0].status === "fulfilled") setQuote(results[0].value[stock.code] || null);
-      if (results[1].status === "fulfilled") setDaily(safeArray<KlineRow>(results[1].value));
+      if (results[1].status === "fulfilled") {
+        const rows = safeArray<KlineRow>(results[1].value);
+        setDaily(rows);
+        if (!rows.length) setDailyError("该股票暂无可用日 K 数据");
+      } else {
+        setDaily([]);
+        setDailyError(results[1].reason instanceof Error ? results[1].reason.message : "日 K 数据加载失败");
+      }
       if (results[2].status === "fulfilled") setBlocks(results[2].value);
       if (results[3].status === "fulfilled") setHotConcepts(safeArray<HotConcept>(results[3].value));
       setLoading(false);
     });
     return () => { active = false; };
-  }, [stock.code, quoteDate]);
+  }, [stock.code, quoteDate, reloadKey]);
 
   useEffect(() => {
     let active = true;
-    setMinuteLoading(true); setMinute(null);
-    api.intraday([stock.code], quoteDate, intradayDays).then((data) => {
-      if (active) setMinute(data);
-    }).catch(() => { if (active) setMinute({ requested_date: quoteDate, series: {} }); })
-      .finally(() => { if (active) setMinuteLoading(false); });
-    return () => { active = false; };
+    let timer: number | undefined;
+    setMinuteLoading(true); setMinute(null); setLatestIntraday(false);
+
+    const loadMinute = async (initial: boolean) => {
+      let shouldPoll = false;
+      try {
+        const session = await api.marketSession().catch(() => null);
+        if (!active) return;
+        setMarketSession(session);
+        const useLatest = shouldUseLatestIntraday(session);
+        shouldPoll = Boolean(useLatest && session?.poll);
+        setLatestIntraday(useLatest);
+        const [bundle, freshQuote] = await Promise.all([
+          api.intraday([stock.code], useLatest ? null : quoteDate, intradayDays),
+          useLatest ? api.quote(stock.code).catch(() => null) : Promise.resolve(null),
+        ]);
+        if (!active) return;
+        setMinute(bundle);
+        if (freshQuote?.[stock.code]) setQuote(freshQuote[stock.code]);
+      } catch {
+        if (active && initial) setMinute({ requested_date: quoteDate, series: {} });
+      } finally {
+        if (active && initial) setMinuteLoading(false);
+        if (active && shouldPoll) timer = window.setTimeout(() => { void loadMinute(false); }, LIVE_INTRADAY_REFRESH_MS);
+      }
+    };
+    void loadMinute(true);
+    return () => { active = false; if (timer !== undefined) window.clearTimeout(timer); };
   }, [stock.code, quoteDate, intradayDays]);
 
   useEffect(() => {
@@ -291,23 +373,60 @@ function StockModal({ stock, quoteDate, onClose }: { stock: Pick<LadderStock, "c
   }, [selectedConcept, stock.code]);
 
   const livePct = finite(quote?.change_pct);
+  const minutePoints = minute?.series?.[stock.code]?.points || [];
+  const visibleDaily = daily.slice(-120);
+  const minuteChartOption = useMemo(() => stockMinuteOption(minute, stock.code), [minute, stock.code]);
+  const dailyChartOption = useMemo(() => dailyOption(daily), [daily]);
+  const onChartPointer = useCallback((index: number | null) => {
+    setHoverIndex((current) => current === index ? current : index);
+  }, []);
+  useEffect(() => { setHoverIndex(null); }, [stock.code, chartTab, intradayDays]);
+  const hoveredQuote = useMemo(() => {
+    if (hoverIndex == null) return null;
+    if (chartTab === "minute") {
+      const point = minutePoints[hoverIndex];
+      if (!point) return null;
+      const directPct = finite(point.pct);
+      const previousClose = finite(minute?.series?.[stock.code]?.previous_close);
+      const derivedPct = directPct ?? (previousClose && previousClose > 0
+        ? (point.price / previousClose - 1) * 100 : null);
+      return { price: point.price, pct: derivedPct, label: point.label || `${point.date || ""} ${point.time}`.trim() };
+    }
+    const row = visibleDaily[hoverIndex];
+    if (!row) return null;
+    const previousClose = hoverIndex > 0 ? finite(visibleDaily[hoverIndex - 1]?.close) : null;
+    const pct = previousClose && previousClose > 0 ? (row.close / previousClose - 1) * 100 : null;
+    return { price: row.close, pct, label: row.datetime || row.date || "" };
+  }, [chartTab, hoverIndex, minute, minutePoints, stock.code, visibleDaily]);
+  const displayedPrice = finite(hoveredQuote?.price) ?? finite(quote?.price);
+  const displayedPct = hoveredQuote ? finite(hoveredQuote.pct) : livePct;
+  const displayedQuoteDate = latestIntraday
+    ? (marketSession?.quotes_of || minute?.series?.[stock.code]?.date || "最新交易日")
+    : (quoteDate || "最近交易日");
+  const latestIntradayLabel = marketSession?.phase_key === "closed" ? "最新收盘" : "实时";
+  const toggleWatch = () => {
+    const current = loadWatch();
+    const next = current.includes(stock.code) ? current.filter((code) => code !== stock.code) : [...current, stock.code];
+    saveWatch(next);
+    setWatched(next.includes(stock.code));
+  };
   return createPortal((
     <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/45 p-3 backdrop-blur-[2px]" onMouseDown={(event) => { event.stopPropagation(); onClose(); }}>
       <section className="glass relative flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-2xl" onMouseDown={(event) => event.stopPropagation()}>
         <header className="flex items-start gap-3 border-b border-border px-5 py-4">
           <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2"><h2 className="text-lg font-bold">{stock.name}</h2><span className="font-mono text-xs text-muted-foreground">{stock.code}</span></div>
+            <div className="flex flex-wrap items-center gap-2"><h2 className="text-lg font-bold"><StockLink code={stock.code} title={`在同花顺打开${stock.name}（${stock.code}）`}>{stock.name}</StockLink></h2><button type="button" aria-label={watched ? `取消关注${stock.name}` : `关注${stock.name}`} aria-pressed={watched} onClick={toggleWatch} className={cn("rounded p-1 transition", watched ? "text-amber-500" : "text-muted-foreground hover:text-amber-500")}><Star className={cn("h-4 w-4", watched && "fill-current")} /></button><span className="font-mono text-xs text-muted-foreground">{stock.code}</span></div>
             <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
               <span>成交额 {yi(quote?.amount_wan != null ? quote.amount_wan * 10000 : null)}</span>
               <span>流通市值 {quote?.float_mcap_yi ? `${quote.float_mcap_yi.toFixed(2)}亿` : "—"}</span>
               <span>换手率 {quote?.turnover_pct != null ? `${quote.turnover_pct.toFixed(2)}%` : "—"}</span>
-              <span>行情日 {quoteDate || "最近交易日"}</span>
+              <span>行情日 {displayedQuoteDate}{latestIntraday ? ` · ${latestIntradayLabel}` : ""}</span>
             </div>
           </div>
           <div className="flex items-center gap-2">
             <div className="rounded-lg bg-muted p-1 text-xs">
               <div className="relative inline-block">
-                <button className={cn("inline-flex items-center gap-1 rounded-md px-3 py-1.5", chartTab === "minute" && "bg-card font-semibold text-primary shadow-sm")} onClick={() => { setChartTab("minute"); setIntradayMenu((value) => !value); }}>{intradayDays}日分时<ChevronDown className="h-3.5 w-3.5" /></button>
+                <button className={cn("inline-flex items-center gap-1 rounded-md px-3 py-1.5", chartTab === "minute" && "bg-card font-semibold text-primary shadow-sm")} onClick={() => { setChartTab("minute"); setIntradayMenu((value) => !value); }}>{intradayDays === 1 ? "分时图" : `${intradayDays}日分时`}<ChevronDown className="h-3.5 w-3.5" /></button>
                 {intradayMenu && <div className="absolute right-0 top-[calc(100%+6px)] z-10 w-28 overflow-hidden rounded-xl border border-border bg-card py-1 shadow-xl">{[1, 2, 3, 4, 5].map((days) => <button key={days} onClick={() => { setIntradayDays(days); setChartTab("minute"); setIntradayMenu(false); }} className={cn("block w-full px-3 py-2 text-left hover:bg-muted", days === intradayDays && "bg-primary/10 font-semibold text-primary")}>{days}日分时</button>)}</div>}
               </div>
               <button className={cn("rounded-md px-3 py-1.5", chartTab === "daily" && "bg-card font-semibold text-primary shadow-sm")} onClick={() => setChartTab("daily")}>日K线</button>
@@ -316,8 +435,9 @@ function StockModal({ stock, quoteDate, onClose }: { stock: Pick<LadderStock, "c
           </div>
         </header>
         <div className="min-h-0 overflow-y-auto px-5 py-4">
+          {warning && <div className="mb-4 rounded-xl border border-danger/30 bg-danger/10 px-4 py-3 text-xs leading-5 text-danger"><b className="block text-sm">{warning.title}</b><span className="text-foreground/75">{warning.detail}</span></div>}
           <div className="mb-3 flex gap-2 border-b border-border pb-2 text-sm">
-            <button onClick={() => setContentTab("market")} className={cn("rounded-lg px-3 py-1.5", contentTab === "market" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted")}>行情</button>
+            <button onClick={() => { setContentTab("market"); setHoverIndex(null); }} className={cn("rounded-lg px-3 py-1.5", contentTab === "market" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted")}>行情</button>
             <button onClick={() => setContentTab("concept")} className={cn("rounded-lg px-3 py-1.5", contentTab === "concept" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted")}>概念</button>
           </div>
           {loading ? loadingBlock("加载行情数据…") : contentTab === "concept" ? (
@@ -337,8 +457,12 @@ function StockModal({ stock, quoteDate, onClose }: { stock: Pick<LadderStock, "c
             </div>
           ) : (
             <>
-              <div className="mb-1 flex items-baseline gap-3"><span className={cn("text-2xl font-bold", pctColor(livePct))}>{quote?.price ?? "—"}</span><span className={cn("font-semibold", pctColor(livePct))}>{signed(livePct)}</span></div>
-              {chartTab === "minute" ? (minuteLoading ? loadingBlock(`加载 ${intradayDays} 日分时…`) : <Chart option={stockMinuteOption(minute, stock.code)} className="h-[360px] w-full" />) : <><Chart option={dailyOption(daily)} className="h-[360px] w-full" /><div className="-mt-5 flex items-center gap-3 px-2 text-[11px] text-muted-foreground"><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-[#ef4444]" />涨</span><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-[#16a34a]" />跌</span><span className="text-[#2563eb]">━ MA5</span><span className="text-[#d97706]">━ MA10</span><span className="text-[#8b5cf6]">━ MA20</span></div></>}
+              <div data-testid="stock-chart-readout" aria-live="polite" className="mb-1 flex min-h-9 flex-wrap items-baseline gap-x-3 gap-y-1">
+                <span className={cn("text-2xl font-bold tabular-nums", pctColor(displayedPct))}>{displayedPrice == null ? "—" : displayedPrice.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 3 })}</span>
+                <span className={cn("font-semibold tabular-nums", pctColor(displayedPct))}>{signed(displayedPct)}</span>
+                {hoveredQuote?.label && <span className="text-[11px] font-normal text-muted-foreground">{hoveredQuote.label}</span>}
+              </div>
+              {chartTab === "minute" ? (minuteLoading ? loadingBlock(`加载 ${intradayDays} 日分时…`) : <Chart option={minuteChartOption} className="h-[360px] w-full" onPointerIndex={onChartPointer} testId="stock-price-chart" />) : dailyError ? <div className="grid h-[360px] place-items-center rounded-xl border border-dashed border-border bg-muted/15 px-6 text-center"><div><p className="text-sm font-medium">日 K 暂时不可用</p><p className="mt-2 max-w-md text-xs text-muted-foreground">{dailyError}</p><button type="button" onClick={() => setReloadKey((value) => value + 1)} className="mt-4 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-semibold hover:bg-muted">重新加载</button></div></div> : <><Chart option={dailyChartOption} className="h-[360px] w-full" onPointerIndex={onChartPointer} testId="stock-price-chart" /><div className="-mt-5 flex items-center gap-3 px-2 text-[11px] text-muted-foreground"><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-[#ef4444]" />涨</span><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-[#16a34a]" />跌</span><span className="text-[#2563eb]">━ MA5</span><span className="text-[#d97706]">━ MA10</span><span className="text-[#8b5cf6]">━ MA20</span></div></>}
               {chartTab === "minute" && !minuteLoading && !(minute?.series?.[stock.code]?.points?.length) && <p className="-mt-48 mb-40 text-center text-sm text-muted-foreground">该行情日的分钟线不在数据源最近窗口内</p>}
             </>
           )}

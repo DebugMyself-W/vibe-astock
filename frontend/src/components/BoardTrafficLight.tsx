@@ -2,7 +2,7 @@ import { useEffect, useId, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, CheckCircle2, ChevronDown, Circle, CircleHelp, Info, ShieldAlert, TrafficCone, Users, X } from "lucide-react";
 import { Caliber } from "@/components/ui/Caliber";
-import { type LimitGene } from "@/lib/api";
+import { api, type LimitGene } from "@/lib/api";
 import { safeArray, type BoardTrafficLight, type StockTrafficLight, type TrafficLightColor, type TrafficSignal } from "@/lib/agent";
 import { cn } from "@/lib/utils";
 
@@ -148,7 +148,17 @@ function StockTrafficDetail({ light }: { light: StockTrafficLight }) {
 
   useEffect(() => {
     if (!open || !light.code) return;
-    setLimitGene({ available: false, reason: "涨停基因暂未接入当前上游版本" });
+    let cancelled = false;
+    setLimitGene(null);
+    api.limitGene(light.code)
+      .then((data) => { if (!cancelled) setLimitGene(data); })
+      .catch((error) => {
+        if (!cancelled) {
+          const detail = error instanceof Error ? error.message : "读取失败";
+          setLimitGene({ available: false, reason: `涨停基因数据读取失败：${detail}` });
+        }
+      });
+    return () => { cancelled = true; };
   }, [open, light.code]);
 
   return (

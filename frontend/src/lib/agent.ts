@@ -569,7 +569,7 @@ export interface StockCtx {
   in_limit_up?: boolean; boards?: number; first_seal?: string | null;
   broken_times?: number; sector?: string; board_type?: string; was_broken?: boolean;
 }
-export interface Fill { side: "buy" | "sell"; date: string; price: number; shares: number; }
+export interface Fill { side: "buy" | "sell"; date: string; price: number; shares: number; fee?: number; }
 export interface Settled {
   has_fills: boolean; closed: boolean;
   avg_cost?: number; avg_sell?: number; amount?: number;
@@ -588,6 +588,28 @@ export interface Trade {
   market: MarketCtx; stock: StockCtx;
   planned_stop?: number | null; planned_target?: number | null;
   fills?: Fill[]; settled?: Settled; exit_market?: MarketCtx | null;
+  import_meta?: { method: "image_ocr"; source_hashes: string[]; fingerprints: string[]; last_imported_at?: string } | null;
+}
+export interface ImportWarning {
+  code: string; message: string; field?: string; severity: "warning" | "error";
+}
+export interface ExistingTradeCandidate {
+  trade_id: string; date: string; name: string; open_shares: number; fills: number;
+}
+export interface JournalImportFill extends Fill {
+  confidence?: number; reported_amount?: number; warnings?: ImportWarning[];
+}
+export interface JournalImportDraft {
+  draft_id: string; source_hash: string; code: string; name: string; playbook: string;
+  as_planned: boolean | null; note: string; fills: JournalImportFill[];
+  reported_pnl?: number | null; confidence: number; warnings: ImportWarning[];
+  security_candidates: Array<{code: string; name: string; market?: string}>;
+  existing_candidates: ExistingTradeCandidate[]; duplicate: boolean; raw_lines: string[];
+}
+export interface JournalImportPreview {
+  client_id: string; source_hash: string;
+  ocr: { confidence: number; line_count: number };
+  drafts: JournalImportDraft[];
 }
 export interface Bucket {
   count: number; scored: number; win_rate: number | null;

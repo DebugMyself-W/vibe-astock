@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 import datetime
+import sqlite3
 import urllib.request
+from pathlib import Path
 from typing import Optional
 
+from ..paths import data_path
 from ..reflection import _name_code_map, _tx_symbol
 from ..tools import agent_reach_search
 from ..util import china_now, is_a_share_closed
@@ -46,20 +49,51 @@ def _zt_name_map() -> dict:
         return {}
 
 
+def _local_name_code_map() -> dict[str, str]:
+    """Return the persisted canonical stock catalog without touching the network.
+
+    Deep-dive requests commonly start with a six-digit code.  Loading AkShare's
+    full-market name table merely to validate that code can exhaust the public
+    worker timeout, while the growth-ladder corpus already persists the same
+    canonical catalog.  A missing/unmigrated database is a normal degraded
+    state, so callers can still fall back to the partial limit-up pool and let
+    the quote request validate the code.
+    """
+    path = Path(data_path("cache", "growth_ladders.sqlite"))
+    if not path.is_file():
+        return {}
+    try:
+        with sqlite3.connect(path, timeout=0.2) as db:
+            db.execute("PRAGMA query_only=ON")
+            rows = db.execute(
+                "SELECT name, canonical_code FROM instrument_master "
+                "WHERE security_type='stock' AND name<>''"
+            ).fetchall()
+        return {str(name).strip(): str(code).strip().zfill(6) for name, code in rows if name and code}
+    except (OSError, sqlite3.Error):
+        return {}
+
+
 def resolve(code_or_name: str) -> tuple[Optional[str], Optional[str]]:
     """输入代码或简称 → (6位代码, 名称)。识别不了返回 (None, None)。"""
     s = (code_or_name or "").strip()
-    m = _name_code_map()
+    # Numeric lookups must remain strictly local.  Both the all-market catalog
+    # and the limit-up pool may perform network I/O and can exhaust the public
+    # worker timeout before the already-required Tencent quote validation runs.
+    local_map = _local_name_code_map()
     if s.isdigit() and len(s) == 6:
-        rev = {v: k for k, v in m.items()}
-        if m and s not in rev:
-            return None, None  # 名称表可用但查无此代码 → 无效标的
-        if s in rev:
-            return s, rev[s]
-        # 主名称表不可用时，从涨停池里补个名字（拿不到就用代码当名字，不阻断）
-        return s, {v: k for k, v in _zt_name_map().items()}.get(s, s)
+        known_names = {code: name for name, code in local_map.items()}
+        if s in known_names:
+            return s, known_names[s]
+        if local_map:
+            return None, None
+        # No complete local catalog is available.  Preserve degraded operation;
+        # get_profile() immediately validates the code against Tencent quotes.
+        return s, s
+    main_map = local_map or _name_code_map()
+    zt_map = _zt_name_map()
     plain = s.split("（")[0].split("(")[0].strip()
-    code = m.get(s) or m.get(plain) or _zt_name_map().get(s) or _zt_name_map().get(plain)
+    code = main_map.get(s) or main_map.get(plain) or zt_map.get(s) or zt_map.get(plain)
     return code, (s if code else None)
 
 

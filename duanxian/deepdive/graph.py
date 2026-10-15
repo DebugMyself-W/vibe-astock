@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 
 from langgraph.graph import END, START, StateGraph
 
@@ -21,6 +22,14 @@ from ..util import china_today, is_degraded_report
 
 _JUDGE = "裁判"
 _ROUTES = {JOIN: JOIN, AVOID: AVOID, _JUDGE: _JUDGE}
+
+
+def _resolved_name(name: str | None, code: str, profile: str) -> str:
+    """Use the already-fetched quote name when a numeric input skipped the full catalog."""
+    if name and name != code:
+        return name
+    match = re.search(r"(?:^|；)名称\s+([^｜；\n]+)", profile)
+    return match.group(1).strip() if match else (name or code)
 
 
 def build_deepdive_graph(max_rounds: int = 1, *, llm=None, data_source=None, progress=None, check=None, pack=None):
@@ -65,6 +74,7 @@ def run(code_or_name: str, trade_date: str | None = None, *, llm=None, data_sour
     profile = source.get_profile(code)  # 一次性行情快照，各分析师共享
     if is_degraded_report(profile):   # 连行情都取不到 → 停牌/无效标的，别白跑 7 次 LLM
         return {"error": f"{name or code} 行情不可用（可能停牌或非有效标的），已中止深挖"}
+    name = _resolved_name(name, code, profile)
     trade_date = trade_date or china_today()   # 始终以交易所时区记录资料日期
     init = {
         "code": code, "name": name or code, "trade_date": trade_date, "profile": profile,

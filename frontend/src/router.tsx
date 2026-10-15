@@ -19,6 +19,10 @@ import { StockData } from "@/pages/StockData";
 import { Intel } from "@/pages/Intel";
 import { Settings } from "@/pages/Settings";
 import { TodayValidation } from "@/pages/TodayValidation";
+import { DragonTigerBoard } from "@/pages/DragonTigerBoard";
+import { GrowthLadders } from "@/pages/GrowthLadders";
+import { AnomalyCenter } from "@/pages/AnomalyCenter";
+import { BoardPatternResearch } from "@/pages/BoardPatternResearch";
 
 // basename 跟着构建时的 --base 走，这样挂在子路径下内部跳转才不会掉回站点根目录
 export const router = createBrowserRouter([
@@ -30,11 +34,15 @@ export const router = createBrowserRouter([
       { path: "/agent/review", element: <AgentReview /> },
       { path: "/daily-review", element: <DailyReview /> },
       { path: "/first-board", element: <FirstBoard /> },
+      { path: "/dragon-tiger-board", element: <DragonTigerBoard /> },
+      { path: "/growth-ladders", element: <GrowthLadders /> },
       { path: "/heat", element: <AgentWeekly /> },
       { path: "/journal", element: <Journal /> },
       { path: "/notes", element: <ResearchNotes /> },
       { path: "/backtest", element: <Backtest /> },
       { path: "/watch", element: <DailyWatch /> },
+      { path: "/anomaly-center", element: <AnomalyCenter /> },
+      { path: "/board-pattern-research", element: <BoardPatternResearch /> },
       { path: "/yesterday-ladder", element: <DailyWatch view="yesterday" /> },
       { path: "/backtest-agent", element: <StrategyBacktest /> },
       { path: "/my-stocks", element: <MyStocks /> },

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import threading
+import urllib.parse
+import urllib.request
 from typing import Optional
 
 from net_utils import call_with_requests_timeout, market_urlopen
@@ -14,10 +17,37 @@ logger = logging.getLogger(__name__)
 from .util import china_now, china_today, is_a_share_closed, is_weekend
 
 _REF_STOCK = "sh600000"  # 浦发银行，流动性好、每个交易日都有，用来取真实交易日序列
+_TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+
+
+def _tencent_ref_dates(start: str, end: str) -> list[str]:
+    """腾讯参考股日 K 的真实交易日；它比加载 akshare 快得多。"""
+    param = f"{_REF_STOCK},day,{start},{end},640,qfq"
+    query = urllib.parse.urlencode({"param": param})
+    request = urllib.request.Request(
+        f"{_TENCENT_KLINE_URL}?{query}",
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
+    )
+    raw = market_urlopen(request, timeout=5).read().decode("utf-8", "ignore")
+    payload = json.loads(raw)
+    node = ((payload.get("data") or {}).get(_REF_STOCK) or {})
+    rows = node.get("qfqday") or node.get("day") or []
+    dates = {
+        str(row[0])[:10]
+        for row in rows
+        if isinstance(row, list) and row and start <= str(row[0])[:10] <= end
+    }
+    return sorted(dates)
 
 
 def _ref_dates(start: str, end: str) -> list[str]:
     """参考股在 [start, end] 区间内的真实交易日（升序，YYYY-MM-DD）。失败返回空表。"""
+    try:
+        dates = _tencent_ref_dates(start, end)
+        if dates:
+            return dates
+    except Exception as exc:  # noqa: BLE001  腾讯不可用时继续走独立历史源
+        logger.debug("腾讯交易日序列读取失败，回退 akshare: %s", exc)
     try:
         df = call_with_requests_timeout(
             "akshare.stock_feature.stock_hist_tx",
@@ -82,6 +112,17 @@ def trade_dates_ending_at(end_date: str, n: int = 10) -> list[str]:
         datetime.datetime.strptime(end_date, "%Y-%m-%d") - datetime.timedelta(days=n * 3 + 16)
     ).strftime("%Y-%m-%d")
     dates = [d for d in _ref_dates(start, end_date) if d <= end_date]
+    # 腾讯参考股历史 K 线在收盘后偶尔会比实时行情晚一场。实时行情已经明确
+    # 携带今天的交易时间戳、且市场已经收盘时，它足以证明今天是交易日；不能
+    # 因历史端点尚未落下最后一根 K 线，就让所有收盘增量任务把今天判成非法。
+    if (
+        end_date == china_today()
+        and not is_weekend(end_date)
+        and is_a_share_closed()
+        and quote_trade_day() == end_date
+        and end_date not in dates
+    ):
+        dates.append(end_date)
     # 未收盘的今天不算「已定稿」，与 last_trade_dates 口径保持一致
     if dates and dates[-1] == china_today() and not is_a_share_closed():
         dates = dates[:-1]

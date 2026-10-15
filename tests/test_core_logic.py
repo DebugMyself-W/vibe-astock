@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import pytest
 import socket
 
@@ -78,6 +79,46 @@ class TestLatestSession:
         monkeypatch.setattr(tc, "is_weekend", lambda d: True)
         monkeypatch.setattr(tc, "last_trade_dates", lambda n=5: [])
         assert tc.latest_session() is None
+
+    def test_reference_dates_use_fast_tencent_kline_before_akshare(self, monkeypatch):
+        """日期控件不能为了一个交易日先阻塞十几秒加载 akshare。"""
+        payload = {
+            "data": {
+                "sh600000": {
+                    "qfqday": [
+                        ["2026-09-30", "9", "9", "9", "9", "1"],
+                        ["2026-10-08", "9", "9", "9", "9", "1"],
+                        ["2026-10-09", "9", "9", "9", "9", "1"],
+                        ["2026-10-12", "9", "9", "9", "9", "1"],
+                    ]
+                }
+            }
+        }
+
+        class Response:
+            def read(self):
+                return json.dumps(payload).encode("utf-8")
+
+        monkeypatch.setattr(tc, "market_urlopen", lambda *_args, **_kwargs: Response())
+        monkeypatch.setattr(
+            tc,
+            "call_with_requests_timeout",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应走慢速回退")),
+        )
+
+        assert tc._ref_dates("2026-10-01", "2026-10-09") == ["2026-10-08", "2026-10-09"]
+
+    def test_closed_quote_day_is_appended_when_historical_kline_lags(self, monkeypatch):
+        """收盘行情已确认今天开市时，历史 K 线晚到不能把今天拒绝为交易日。"""
+        monkeypatch.setattr(tc, "china_today", lambda: "2026-10-14")
+        monkeypatch.setattr(tc, "is_weekend", lambda _date: False)
+        monkeypatch.setattr(tc, "is_a_share_closed", lambda: True)
+        monkeypatch.setattr(tc, "quote_trade_day", lambda: "2026-10-14")
+        monkeypatch.setattr(tc, "_ref_dates", lambda _start, _end: ["2026-10-12", "2026-10-13"])
+
+        assert tc.trade_dates_ending_at("2026-10-14", 3) == [
+            "2026-10-12", "2026-10-13", "2026-10-14",
+        ]
 
 
 @pytest.mark.unit
@@ -3565,10 +3606,12 @@ class TestRealtimeQuotesAreLabeledWithTheirSession:
         monkeypatch.setattr(server, "is_a_share_closed", lambda: False)
         monkeypatch.setattr(server, "is_weekend", lambda d: False)
         monkeypatch.setattr(tc, "quote_trade_day", lambda: "2026-07-29")
+        monkeypatch.setattr(tc, "latest_session", lambda: "2026-07-29")
 
         monkeypatch.setattr(server, "china_now", lambda: __import__("datetime").datetime(2026,7,30,8,30))
         r = server.api_market_session()
         assert r["quotes_of"] == "2026-07-29"
+        assert r["latest_closed"] == "2026-07-29"
         assert r["is_today"] is False, "盘前行情不是今天的，必须说清"
         assert r["phase"] == "盘前"
         assert "2026-07-29" in r["label"], f"label 要点出是哪一场：{r['label']}"
@@ -6173,6 +6216,7 @@ class TestResolve:
     def _patch(monkeypatch, main_map: dict, zt_map: dict):
         from duanxian.deepdive import data as dd
 
+        monkeypatch.setattr(dd, "_local_name_code_map", lambda: {})
         monkeypatch.setattr(dd, "_name_code_map", lambda: main_map)
         monkeypatch.setattr(dd, "_zt_name_map", lambda: zt_map)
         return dd
@@ -6186,8 +6230,9 @@ class TestResolve:
         dd = self._patch(monkeypatch, {}, {"长缆科技": "002879"})
         assert dd.resolve("长缆科技") == ("002879", "长缆科技")
 
-    def test_code_gets_name_from_zt_pool(self, monkeypatch):
+    def test_code_gets_name_from_local_catalog(self, monkeypatch):
         dd = self._patch(monkeypatch, {}, {"长缆科技": "002879"})
+        monkeypatch.setattr(dd, "_local_name_code_map", lambda: {"长缆科技": "002879"})
         assert dd.resolve("002879") == ("002879", "长缆科技")
 
     def test_code_without_any_name_still_usable(self, monkeypatch):
@@ -6199,10 +6244,23 @@ class TestResolve:
         dd = self._patch(monkeypatch, {}, {"长缆科技": "002879"})
         assert dd.resolve("查无此票") == (None, None)
 
-    def test_invalid_code_rejected_when_main_map_alive(self, monkeypatch):
-        """主表可用却查无此代码 → 无效标的。"""
+    def test_invalid_code_rejected_when_local_catalog_alive(self, monkeypatch):
+        """本地规范证券主表可用却查无此代码 → 无效标的。"""
         dd = self._patch(monkeypatch, {"甲股": "000001"}, {})
+        monkeypatch.setattr(dd, "_local_name_code_map", lambda: {"甲股": "000001"})
         assert dd.resolve("999999") == (None, None)
+
+    def test_numeric_code_uses_local_catalog_without_slow_provider(self, monkeypatch):
+        from duanxian.deepdive import data as dd
+
+        monkeypatch.setattr(dd, "_local_name_code_map", lambda: {"甲股": "000001"})
+        monkeypatch.setattr(
+            dd,
+            "_name_code_map",
+            lambda: (_ for _ in ()).throw(AssertionError("数字代码不应请求慢速全市场名称表")),
+        )
+        monkeypatch.setattr(dd, "_zt_name_map", lambda: {})
+        assert dd.resolve("000001") == ("000001", "甲股")
 
     def test_strips_parenthetical(self, monkeypatch):
         dd = self._patch(monkeypatch, {}, {"长缆科技": "002879"})

@@ -3,6 +3,7 @@ import { pctColor, UP_TEXT } from "@/lib/colors";
 import { NotebookPen, Loader2, Trash2, BarChart3, ShieldAlert } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Caliber } from "@/components/ui/Caliber";
+import { JournalImageImport } from "@/components/JournalImageImport";
 import { agentFetch, agentPost, finite, localDate, plain, ratioPct, safeArray, safeRecord } from "@/lib/agent";
 import type {
   AtRiskPosition, AtRiskReport, Attribution, Bucket, ExcursionItem, ExcursionSummary,
@@ -1377,7 +1378,10 @@ export function Journal() {
 
       {/* 录入 */}
       <section className="glass rounded-2xl p-5">
-        <h3 className="mb-3 text-sm font-bold">记一笔</h3>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-bold">记一笔</h3>
+          <JournalImageImport onImported={load} />
+        </div>
         <div className="flex flex-wrap gap-2">
           <input type="date" value={date} onInput={(e) => setDate(e.currentTarget.value)} onChange={(e) => setDate(e.target.value)}
             className="rounded-lg border border-border bg-card px-3 py-2 text-sm" />
@@ -1458,6 +1462,9 @@ export function Journal() {
               <input type="number" step="100" placeholder="股数"
                 value={f.shares || ""} onChange={(e) => setFill(i, { shares: Number(e.target.value) })}
                 className="w-24 rounded border border-border bg-card px-2 py-1 text-[12px]" />
+              <input type="number" min="0" step="0.01" placeholder="实际费用（可选）"
+                value={f.fee ?? ""} onChange={(e) => setFill(i, { fee: e.target.value === "" ? undefined : Number(e.target.value) })}
+                className="w-32 rounded border border-border bg-card px-2 py-1 text-[12px]" />
               <button onClick={() => delFill(i)}
                 className="text-muted-foreground/50 hover:text-danger"><Trash2 className="h-3.5 w-3.5" /></button>
             </div>

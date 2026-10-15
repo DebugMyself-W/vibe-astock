@@ -6,6 +6,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 FRONTEND_DIR="${ROOT_DIR}/frontend"
 PORT="${VIBE_PORT:-8910}"
 HOST="${VIBE_HOST:-127.0.0.1}"
+STARTUP_TIMEOUT="${VIBE_STARTUP_TIMEOUT:-60}"
 RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp}/vibe-astock-${UID}"
 PID_FILE="${RUNTIME_BASE}/server-${PORT}.pid"
 LOG_FILE="${RUNTIME_BASE}/server-${PORT}.log"
@@ -16,6 +17,10 @@ normalize_vibe_proxy_env
 
 if [[ ! "${PORT}" =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
   echo "Invalid VIBE_PORT: ${PORT}" >&2
+  exit 2
+fi
+if [[ ! "${STARTUP_TIMEOUT}" =~ ^[0-9]+$ ]] || ((STARTUP_TIMEOUT < 1 || STARTUP_TIMEOUT > 300)); then
+  echo "Invalid VIBE_STARTUP_TIMEOUT: ${STARTUP_TIMEOUT} (expected 1-300 seconds)" >&2
   exit 2
 fi
 
@@ -30,8 +35,20 @@ else
   exit 2
 fi
 
-if ! "${PYTHON_BIN}" -c 'import mcp' >/dev/null 2>&1; then
-  echo "Python dependency 'mcp' is missing. Run scripts/setup after updating the source." >&2
+python_dependencies_ready() {
+  "${PYTHON_BIN}" -c 'import mcp, rapidocr, onnxruntime, PIL' >/dev/null 2>&1
+}
+
+if ! python_dependencies_ready; then
+  echo "Python dependencies changed; installing requirements.txt before restart..."
+  if ! "${PYTHON_BIN}" -m pip install -r "${ROOT_DIR}/requirements.txt"; then
+    echo "Python dependencies could not be updated. Run scripts/setup after updating the source." >&2
+    exit 2
+  fi
+fi
+
+if ! python_dependencies_ready; then
+  echo "Python dependencies are still unavailable. Run scripts/setup after updating the source." >&2
   exit 2
 fi
 
@@ -165,7 +182,7 @@ if [[ "${health_host}" == "0.0.0.0" || "${health_host}" == "::" ]]; then
 fi
 health_url="${VIBE_HEALTH_URL:-http://${health_host}:${PORT}/api/health}"
 
-for attempt in {1..30}; do
+for ((attempt = 1; attempt <= STARTUP_TIMEOUT; attempt++)); do
   if ! kill -0 "${new_pid}" 2>/dev/null; then
     echo "Server exited before becoming healthy. Recent log:" >&2
     tail -n 40 -- "${LOG_FILE}" >&2 || true
@@ -185,6 +202,6 @@ for attempt in {1..30}; do
   sleep 1
 done
 
-echo "Server did not become healthy within 30 seconds. Recent log:" >&2
+echo "Server did not become healthy within ${STARTUP_TIMEOUT} seconds. Recent log:" >&2
 tail -n 40 -- "${LOG_FILE}" >&2 || true
 exit 1

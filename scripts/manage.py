@@ -59,7 +59,9 @@ def run(argv, root, timeout=900):
 
 def fingerprint(root: Path) -> str:
     """Track installation/build inputs, never user data or generated outputs."""
-    files = [root / p for p in ("requirements.txt", "runtime/package.json", "runtime/package-lock.json")]
+    files = [root / p for p in ("requirements.txt", "requirements-market.txt",
+                                "runtime/package.json", "runtime/package-lock.json")]
+    files = [p for p in files if p.is_file()]
     for directory, dirs, names in os.walk(root / "frontend"):
         dirs[:] = [d for d in dirs if d not in {"node_modules", "dist", ".git"}]
         files += [Path(directory) / n for n in names if not n.endswith(".tsbuildinfo")]
@@ -88,7 +90,7 @@ def dependency_status(root):
     code = """
 import importlib,json
 failures=[]
-for name in ['fastapi','uvicorn','langgraph','langchain_openai','akshare','requests','dotenv','mcp','py_mini_racer','bs4','numpy','pandas','baostock']:
+for name in ['fastapi','uvicorn','langgraph','langchain_openai','akshare','requests','dotenv','mcp','py_mini_racer','bs4','numpy','pandas','baostock','mootdx','rapidocr','onnxruntime','PIL']:
  try: importlib.import_module(name)
  except Exception as exc: failures.append(name+': '+type(exc).__name__)
 print('ASTOCK_IMPORTS='+json.dumps(failures))
@@ -155,6 +157,9 @@ def setup(root: Path):
         run([py, "-m", "ensurepip", "--upgrade"], root)
     print("正在安装 Python 依赖…", flush=True)
     run([py, "-m", "pip", "install", "-r", root / "requirements.txt"], root)
+    # Keep MCP's modern httpx. mootdx is used only for the TDX TCP protocol and
+    # works with the already-installed numpy/pandas stack.
+    run([py, "-m", "pip", "install", "--no-deps", "-r", root / "requirements-market.txt"], root)
     for directory in ("runtime", "frontend"):
         print(f"正在准备 {directory}…", flush=True)
         run(["npm", "ci", "--no-audit", "--no-fund"], root / directory)

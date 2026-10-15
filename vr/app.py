@@ -330,6 +330,212 @@ def market_first_board(date: str | None = Query(None)):
         raise HTTPException(502, f"首板数据异常：{e}") from e
 
 
+@app.get("/api/market/dragon-tiger-board")
+def market_dragon_tiger_board(date: str | None = Query(None)):
+    """每日全市场龙虎榜与公开营业部席位（客观榜单，非推荐）。"""
+    if date:
+        try:
+            date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(400, "date 必须是 YYYY-MM-DD") from exc
+    else:
+        from duanxian.trade_calendar import latest_session
+        date = latest_session()
+        if not date:
+            raise HTTPException(503, "暂时无法确认最近已收盘交易日，请稍后重试")
+    try:
+        return {"data": _cached(
+            "dragon-tiger-board", date, 1800,
+            lambda: astock.daily_dragon_tiger(date),
+        )}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"龙虎榜数据异常：{exc}") from exc
+
+
+@app.get("/api/market/growth-ladders/yang")
+def market_growth_ladders_yang(date: str | None = Query(None)):
+    """盘中返回实时内存天梯，历史日期只返回完整本地快照。"""
+    from duanxian import growth_ladders
+
+    if date:
+        try:
+            date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(400, "date 必须是 YYYY-MM-DD") from exc
+    try:
+        return {"data": growth_ladders.get_current_ladder(date)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"连阳天梯数据异常：{exc}") from exc
+
+
+@app.get("/api/market/growth-ladders/yang/status")
+def market_growth_ladders_yang_status():
+    from duanxian import growth_ladders
+
+    return {"data": growth_ladders.status()}
+
+
+@app.post("/api/market/growth-ladders/yang/sync")
+def market_growth_ladders_yang_sync(date: str | None = Query(None)):
+    """幂等启动首次构建或失败重试；已有运行中的任务不会重复创建。"""
+    from duanxian import growth_ladders
+
+    try:
+        return {"data": growth_ladders.request_sync(date)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/market/anomaly-center/predictions")
+def anomaly_center_predictions(date: str | None = Query(None)):
+    """本地规则预测；覆盖不完整时返回 partial，而不是伪装成空榜。"""
+    from duanxian import anomaly_center
+
+    if date:
+        try:
+            date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(400, "date 必须是 YYYY-MM-DD") from exc
+    try:
+        # The current page refreshes the public tri-state prediction snapshot;
+        # explicit historical dates remain deterministic local baselines.
+        return {"data": anomaly_center.predictions(date, refresh_official=date is None)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"监管异动预测异常：{exc}") from exc
+
+
+@app.get("/api/market/anomaly-center/monitors")
+def anomaly_center_monitors(
+    type: str = Query("all", pattern="^(all|risk_warning|severe_abnormal)$"),  # noqa: A002
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+):
+    from duanxian import anomaly_center
+
+    try:
+        return {"data": anomaly_center.monitors(type, page, page_size)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"监管监控池异常：{exc}") from exc
+
+
+@app.get("/api/market/anomaly-center/search")
+def anomaly_center_search(q: str = Query("", max_length=32)):
+    from duanxian import anomaly_center
+
+    return {"data": anomaly_center.search(q, 10)}
+
+
+@app.get("/api/market/anomaly-center/calculate")
+def anomaly_center_calculate(code: str = Query(...)):
+    from duanxian import anomaly_center
+
+    try:
+        return {"data": anomaly_center.calculate(code)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get("/api/market/anomaly-center/status")
+def anomaly_center_status():
+    from duanxian import anomaly_center
+
+    return {"data": anomaly_center.status()}
+
+
+@app.post("/api/market/anomaly-center/sync")
+def anomaly_center_sync(date: str | None = Query(None)):
+    from duanxian import anomaly_center
+
+    try:
+        return {"data": anomaly_center.request_sync(date)}
+    except ValueError as exc:
+        raise HTTPException(400, "date 必须是 YYYY-MM-DD") from exc
+
+
+class BoardPatternCalculateInput(BaseModel):
+    code: str
+    mode: str = "close"
+    algorithm: str = "v1"
+    date: str | None = None
+
+
+@app.get("/api/market/board-pattern-research/events")
+def board_pattern_events(
+    mode: str = Query("close", pattern="^(close|intraday)$"),
+    date: str | None = Query(None),
+):
+    """连板事件池；历史库构建时仍允许先查看可信的当日事件。"""
+    from duanxian import board_pattern_research
+
+    try:
+        return {"data": board_pattern_research.events(mode, date)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get("/api/market/board-pattern-research/search")
+def board_pattern_search(
+    q: str = Query("", max_length=32),
+    mode: str = Query("close", pattern="^(close|intraday)$"),
+    date: str | None = Query(None),
+):
+    from duanxian import board_pattern_research
+
+    try:
+        return {"data": board_pattern_research.search(q, mode, date, 10)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/market/board-pattern-research/calculate")
+def board_pattern_calculate(body: BoardPatternCalculateInput):
+    from duanxian import board_pattern_research
+
+    try:
+        return {"data": board_pattern_research.calculate(
+            body.code, body.mode, body.algorithm, body.date,
+        )}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get("/api/market/board-pattern-research/status")
+def board_pattern_status():
+    from duanxian import board_pattern_research
+
+    return {"data": board_pattern_research.status()}
+
+
+@app.post("/api/market/board-pattern-research/sync")
+def board_pattern_sync(date: str | None = Query(None)):
+    from duanxian import board_pattern_research
+
+    try:
+        return {"data": board_pattern_research.request_sync(date)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/market/limit-gene")
+def market_limit_gene(code: str = Query(..., description="6 位股票代码")):
+    """读取近一年涨停活跃度、封板成功率与本站股性评分。"""
+    try:
+        return {"data": firstboard.limit_gene(code)}
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"涨停基因数据异常：{e}") from e
+
+
 @app.get("/api/market/turnover-top")
 def market_turnover_top():
     """全市场成交额榜 Top20（客观公开榜单数据，非推荐/非预测/不评分）。全站共享缓存 5 分钟。"""

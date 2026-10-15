@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from duanxian.paths import data_path
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -34,7 +35,7 @@ _PATH = os.path.join(_DIR, "trades.json")
 # 交易记录结构版本。
 # v2 起一笔交易 = 多次成交（fills），以支持分批建仓、做 T、买卖不同日。
 # v3 增加计划退出边界（planned_stop / planned_target）。
-_SCHEMA = 3
+_SCHEMA = 4
 
 # 一次成交
 #   side: buy / sell
@@ -167,8 +168,10 @@ def _migrate(from_schema, trades: list[dict]) -> Optional[list[dict]]:
     v2 → v3：新增计划退出边界（`planned_stop` / `planned_target`）。
     ⚠️ **老记录一律补 None，不做反推** —— 计划止损位是下单时的主观意图，
     按成交价反推出的值不是事实，而在险资金正是拿它计算的。
+
+    v3 → v4：新增图片 OCR 导入元数据。老记录补 None，不伪造来源或哈希。
     """
-    if from_schema not in (1, 2):
+    if from_schema not in (1, 2, 3):
         return None
     _backup_once(f"v{from_schema}")
     out = []
@@ -181,6 +184,8 @@ def _migrate(from_schema, trades: list[dict]) -> Optional[list[dict]]:
         # v3：计划退出边界。老记录没有就是没有 —— 补 None，不倒推
         t.setdefault("planned_stop", None)
         t.setdefault("planned_target", None)
+        # v4: OCR imports keep only non-reversible provenance for duplicate checks.
+        t.setdefault("import_meta", None)
         out.append(t)
     print(f"ℹ️ 交易日志已从 schema {from_schema} 迁移到 {_SCHEMA}（{len(out)} 条，原件已备份）")
     return out
@@ -440,24 +445,16 @@ def _settle(fills: list[dict], fees_cfg: Optional[dict] = None) -> dict:
     return out
 
 
-def add_trade(date: str, code: str, name: str, playbook: str,
-              pnl_pct: Optional[float] = None, as_planned: Optional[bool] = None,
-              note: str = "", fills: Optional[list[dict]] = None,
-              planned_stop: Optional[float] = None,
-              planned_target: Optional[float] = None, import_id: str | None = None) -> dict:
-    """记一笔交易，并**自动钉上当时的市场环境**。
+def _build_trade(date: str, code: str, name: str, playbook: str,
+                 pnl_pct: Optional[float] = None, as_planned: Optional[bool] = None,
+                 note: str = "", fills: Optional[list[dict]] = None,
+                 planned_stop: Optional[float] = None,
+                 planned_target: Optional[float] = None,
+                 import_id: str | None = None, import_meta: dict | None = None) -> dict:
+    """Validate and construct a trade without writing it.
 
-    两种记法（都支持，按你手边有什么填）：
-    - **只填盈亏%**：最省事，适合事后补记。`pnl_pct` 自己填。
-    - **填成交明细 `fills`**：`[{side:buy/sell, date, price, shares}, …]` ——
-      支持分批建仓、做 T、隔日卖出。系统自动算加权成本、已实现盈亏、
-      盈亏金额、持有天数、占用资金。⚠️ 只算已实现部分，不虚构浮盈。
-
-    `as_planned` = 这笔是否按计划执行。
-
-    `planned_stop` / `planned_target` = **下单时**写下的计划止损价 / 目标价。
-    ⚠️ 必须是当时写下的值；在险资金按 `planned_stop` 计算，事后补填会让该口径失真。
-    没写就留空。
+    Keeping construction separate is what lets image imports validate the full
+    batch before performing the journal's single atomic write.
     """
     if import_id is not None and (not isinstance(import_id, str) or len(import_id) != 64 or any(c not in "0123456789abcdef" for c in import_id)):
         raise ValueError("导入记录标识无效")
@@ -511,6 +508,20 @@ def add_trade(date: str, code: str, name: str, playbook: str,
     }
     if import_id is not None:
         trade["legacy_import_id"] = import_id
+    trade["import_meta"] = import_meta
+    return trade
+
+
+def add_trade(date: str, code: str, name: str, playbook: str,
+              pnl_pct: Optional[float] = None, as_planned: Optional[bool] = None,
+              note: str = "", fills: Optional[list[dict]] = None,
+              planned_stop: Optional[float] = None,
+              planned_target: Optional[float] = None, import_id: str | None = None) -> dict:
+    """记一笔交易，并**自动钉上当时的市场环境**。"""
+    trade = _build_trade(
+        date, code, name, playbook, pnl_pct, as_planned, note, fills,
+        planned_stop, planned_target, import_id,
+    )
     with _LOCK:
         trades = _load_raw()
         if import_id is not None and any(t.get("legacy_import_id") == import_id for t in trades):
@@ -519,6 +530,174 @@ def add_trade(date: str, code: str, name: str, playbook: str,
         if not _save(trades):
             raise RuntimeError("账本写入失败（磁盘满或权限问题），这一笔没记上")
     return {"ok": True, "trade": trade}
+
+
+class JournalImportConflict(ValueError):
+    """A reviewed image import conflicts with current journal state."""
+
+
+def _import_fingerprint(code: str, fills: list[dict]) -> str:
+    payload = {"code": str(code).zfill(6), "fills": _norm_fills(fills)}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def _import_meta(t: dict) -> dict:
+    raw = t.get("import_meta")
+    if not isinstance(raw, dict):
+        return {"method": "image_ocr", "source_hashes": [], "fingerprints": []}
+    return {
+        "method": "image_ocr",
+        "source_hashes": [v for v in raw.get("source_hashes", []) if isinstance(v, str)],
+        "fingerprints": [v for v in raw.get("fingerprints", []) if isinstance(v, str)],
+        **({"last_imported_at": raw["last_imported_at"]} if isinstance(raw.get("last_imported_at"), str) else {}),
+    }
+
+
+def image_import_candidates(code: str, fills: list[dict], source_hash: str) -> dict:
+    """Find nearby same-security trades and exact prior imports for preview."""
+    code = str(code or "").strip().zfill(6)
+    if not (len(code) == 6 and code.isdigit()):
+        return {"trades": [], "duplicate": False}
+    valid_dates = []
+    for fill in fills or []:
+        try:
+            valid_dates.append(datetime.date.fromisoformat(str(fill.get("date") or "")))
+        except (TypeError, ValueError):
+            pass
+    first = min(valid_dates) if valid_dates else None
+    last = max(valid_dates) if valid_dates else None
+    try:
+        fingerprint = _import_fingerprint(code, fills) if fills else ""
+    except ValueError:
+        fingerprint = ""
+    rows, duplicate = [], False
+    for trade in _load_raw():
+        if str(trade.get("code") or "").zfill(6) != code:
+            continue
+        meta = _import_meta(trade)
+        if source_hash and source_hash in meta["source_hashes"] or fingerprint and fingerprint in meta["fingerprints"]:
+            duplicate = True
+        settled = trade.get("settled") or {}
+        nearby = bool(float(settled.get("open_shares") or 0) > 0)
+        trade_dates = []
+        for fill in trade.get("fills") or []:
+            try:
+                trade_dates.append(datetime.date.fromisoformat(str(fill.get("date") or "")))
+            except (TypeError, ValueError):
+                pass
+        if not nearby and first and last and trade_dates:
+            nearby = min(abs((day - first).days) for day in trade_dates) <= 7 or min(
+                abs((day - last).days) for day in trade_dates) <= 7
+        if nearby:
+            rows.append({"trade_id": trade.get("id"), "date": trade.get("date"),
+                         "name": trade.get("name") or code,
+                         "open_shares": settled.get("open_shares", 0),
+                         "fills": len(trade.get("fills") or [])})
+    return {"trades": rows[:20], "duplicate": duplicate}
+
+
+def _merge_import_meta(trade: dict, source_hashes: list[str], fingerprint: str, stamp: str) -> None:
+    meta = _import_meta(trade)
+    for source_hash in source_hashes:
+        if source_hash not in meta["source_hashes"]:
+            meta["source_hashes"].append(source_hash)
+    if fingerprint not in meta["fingerprints"]:
+        meta["fingerprints"].append(fingerprint)
+    meta["source_hashes"] = meta["source_hashes"][-100:]
+    meta["fingerprints"] = meta["fingerprints"][-100:]
+    meta["last_imported_at"] = stamp
+    trade["import_meta"] = meta
+
+
+def commit_image_import(items: list[dict]) -> dict:
+    """Atomically create/append a reviewed batch of OCR transaction drafts."""
+    if not isinstance(items, list) or not 1 <= len(items) <= 100:
+        raise ValueError("每次需提交 1–100 条识别草稿")
+    stamp = china_now().strftime("%Y-%m-%d %H:%M:%S") + " CST"
+    with _LOCK:
+        original = _load_raw()
+        # JSON round-trip is deliberate: nested fills/metadata must not mutate the
+        # loaded objects if validation of a later item fails.
+        trades = json.loads(json.dumps(original, ensure_ascii=False))
+        created = updated = skipped = 0
+        affected: list[str] = []
+        for index, item in enumerate(items):
+            try:
+                if not isinstance(item, dict):
+                    raise ValueError("草稿格式不正确")
+                action = str(item.get("action") or "")
+                if action == "skip":
+                    skipped += 1
+                    continue
+                if action not in ("create", "append"):
+                    raise ValueError("必须选择新建、追加或跳过")
+                raw_hashes = item.get("source_hashes") or [item.get("source_hash")]
+                if not isinstance(raw_hashes, list) or not 1 <= len(raw_hashes) <= 20:
+                    raise ValueError("图片来源标识无效")
+                source_hashes = list(dict.fromkeys(str(value or "").lower() for value in raw_hashes))
+                if any(len(value) != 64 or any(c not in "0123456789abcdef" for c in value)
+                       for value in source_hashes):
+                    raise ValueError("图片来源标识无效")
+                code = str(item.get("code") or "").strip().zfill(6)
+                fills = _norm_fills(item.get("fills") or [])
+                if not fills:
+                    raise ValueError("至少需要一笔完整成交")
+                fingerprint = _import_fingerprint(code, fills)
+                duplicate = any(
+                    str(t.get("code") or "").zfill(6) == code and (
+                        any(value in _import_meta(t)["source_hashes"] for value in source_hashes)
+                        or fingerprint in _import_meta(t)["fingerprints"])
+                    for t in trades
+                )
+                if duplicate and item.get("allow_duplicate") is not True:
+                    raise JournalImportConflict("这张截图或同一组成交已经导入；如确需重复，请显式确认")
+                if action == "create":
+                    first_buy = next((fill["date"] for fill in fills if fill["side"] == "buy"), "")
+                    day = str(item.get("date") or first_buy or fills[0]["date"])
+                    trade = _build_trade(
+                        day, code, str(item.get("name") or ""),
+                        str(item.get("playbook") or "其它"), None,
+                        item.get("as_planned"), str(item.get("note") or ""), fills,
+                        None, None,
+                    )
+                    _merge_import_meta(trade, source_hashes, fingerprint, stamp)
+                    trades.append(trade)
+                    created += 1
+                    affected.append(trade["id"])
+                    continue
+                trade_id = str(item.get("trade_id") or "")
+                trade_index = next((n for n, t in enumerate(trades) if t.get("id") == trade_id), None)
+                if trade_index is None:
+                    raise ValueError("要追加的原交易不存在或已被删除")
+                trade = dict(trades[trade_index])
+                if str(trade.get("code") or "").zfill(6) != code:
+                    raise ValueError("不能把成交追加到另一只证券")
+                combined = _norm_fills([*(trade.get("fills") or []), *fills])
+                settled = _settle(combined)
+                trade["fills"], trade["settled"] = combined, settled
+                trade["pnl_pct"] = (round(float(settled["realized_pct"]), 2)
+                                     if settled.get("realized_pct") is not None else None)
+                first_buy, last_sell = settled.get("first_buy"), settled.get("last_sell")
+                trade["exit_market"] = (_market_context(last_sell)
+                                        if last_sell and last_sell != (first_buy or trade.get("date")) else None)
+                incoming_note = str(item.get("note") or "").strip()
+                if incoming_note and incoming_note not in str(trade.get("note") or ""):
+                    trade["note"] = (str(trade.get("note") or "").strip() + "\n" + incoming_note).strip()[:500]
+                trade["updated_at"] = stamp
+                _merge_import_meta(trade, source_hashes, fingerprint, stamp)
+                trades[trade_index] = trade
+                updated += 1
+                affected.append(trade_id)
+            except (ValueError, TypeError) as exc:
+                if isinstance(exc, JournalImportConflict):
+                    raise JournalImportConflict(f"第 {index + 1} 条：{exc}") from exc
+                raise ValueError(f"第 {index + 1} 条：{exc}") from exc
+        if created or updated:
+            if not _save(trades):
+                raise RuntimeError("账本写入失败，整批识别结果均未保存")
+        return {"ok": True, "created": created, "updated": updated,
+                "skipped": skipped, "trade_ids": affected}
 
 
 def update_trade(trade_id: str, *, fills=None, note=None, as_planned=_UNSET,

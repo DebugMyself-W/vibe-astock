@@ -63,6 +63,7 @@ def test_store_delete_with_followup_preserves_other_conversation(tmp_path):
 def test_cache_revision_preserved_and_recent_data_expires(tmp_path,monkeypatch):
  from duanxian import cache_policy as c
  import os,time
+ monkeypatch.setattr(c,'china_today',lambda:'2026-09-28')
  p=tmp_path/'2026-09-08.json'
  assert c.write(str(p),{'count':73})
  assert c.write(str(p),{'count':74})
@@ -70,8 +71,10 @@ def test_cache_revision_preserved_and_recent_data_expires(tmp_path,monkeypatch):
  revisions=list((tmp_path/'_revisions'/'2026-09-08').glob('*.json'))
  assert len(revisions)==1 and json.loads(revisions[0].read_text())=={'count':73}
  os.utime(p,(0,0))
- # near history must be revisited, rather than frozen forever
+ # The 20-day revision window is inclusive and must not depend on wall-clock today.
  assert not c.fresh(str(p),'2026-09-08')
+ monkeypatch.setattr(c,'china_today',lambda:'2026-09-29')
+ assert c.fresh(str(p),'2026-09-08')
 
 def test_post_review_partial_failure_does_not_skip_other_captures(monkeypatch):
  from review_agent import post_review as p
