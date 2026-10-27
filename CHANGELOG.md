@@ -3,6 +3,23 @@
 格式遵循 Keep a Changelog，并采用语义化版本。v1.1.3 及更早的条目保留旧版原文。
 底座（Vibe Research）此前的变化见 [Vibe Research 的 CHANGELOG](https://github.com/simonlin1212/Vibe-Research/blob/main/CHANGELOG.md)。
 
+## [2.1.4] - 2026-10-26
+
+修独立安装的 CodeBuddy CLI 未登录时，WorkBuddy 已登录仍报未登录的问题（提交 `5d6d2e2`），移植自 Vibe Research v2.2.4 的同一修复（Vibe Research #56）；短线功能和页面用法都没有变化。
+
+### 修复
+
+- **独立版没登录，内置版已登录也用不了**：独立安装的 CodeBuddy CLI（npm 全局或官方原生安装）排在 WorkBuddy 内置 CLI 前面。原来取第一个存在的程序，不看登录；装过独立版但没登录时，WorkBuddy 已登录也一直报「没有可用的 WorkBuddy / CodeBuddy 登录」。现在自动选中的程序明确未登录、且没有用 `CODEBUDDY_BIN` 或设置页指定位置时，依次检查 WorkBuddy 内置 CLI：先查固定位置，Windows 再查「已安装的程序」登记，改用第一个已登录的。
+- 设置页卡片和实际调用共用同一选择逻辑。检测失败、超时、版本过旧不回退；都没登录时状态和文案不变；回退过程中可以取消。
+- #23 里另一种现象（卡片显示已登录、测试连接仍报未登录）还没在 Windows 上复现，不在本次修复范围。
+
+### 测试
+
+- macOS（2026-10-26）：同步 Vibe Research 的 6 条回归用例。用假 CLI 复现「独立版未登录 + 内置版已登录」：修复前报未登录，修复后连上内置版。
+- 后端全套 1454 项：1446 通过、8 跳过、0 失败；desktop 406/406；前后端类型检查通过。
+- 独立审查（Codex 6.1 Sol）通过。
+- 没有 Windows 实机，也没有用真实已登录的 WorkBuddy 账号复验这一条。
+
 ## [2.1.3] - 2026-10-24
 
 修 WorkBuddy 5.8 起「接入 AI」检测失败的问题（issue #23），移植自 Vibe Research v2.2.3 的同一修复；短线功能和页面用法都没有变化。
